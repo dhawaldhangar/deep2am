@@ -150,10 +150,10 @@ export const CAMPAIGN_CHAPTERS: SolCampaignChapter[] = [
     speakerRole: 'Earth Mission Control',
     commNote: 'Final Landing Window',
     storyPrompt:
-      'The automated Supply Rocket is descending to Jezero Crater! Make any final 3D module adjustments, then click End Sol & Watch Night Cycle to bring it home!',
+      'The automated Supply Rocket is descending to Jezero Crater! Review the landing beacon crisis, lock in your final directive, and monitor base systems for the 2-minute landing window.',
     targetModule: 'any',
     hazardType: 'none',
-    dilemmaId: null,
+    dilemmaId: 'supply-lander-approach',
     nasaCredit: 'NASA Mars Sample & Cargo Extraction Telemetry',
   },
 ];

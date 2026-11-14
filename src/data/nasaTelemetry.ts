@@ -427,4 +427,31 @@ export const DILEMMA_EVENTS: DilemmaEvent[] = [
       },
     ],
   },
+  {
+    id: 'supply-lander-approach',
+    title: 'Supply Lander Descent Beacon Alignment',
+    category: 'comms',
+    description:
+      'The automated NASA Supply Lander is entering Jezero airspace! You can boost the high-power landing radar beacon or guide it manually using passive optical markers.',
+    commDelayNote: '14-Min Comm Delay: Houston cannot steer the final skycrane burn—your base beacon guides touchdown.',
+    nasaSourceLabel: 'NASA Mars Architecture Rendezvous Log',
+    nasaSourceDetail:
+      'Data Source: NASA Mars Sample & Cargo Entry, Descent, and Landing (EDL) — Precision surface beacons cut landing scatter down to tens of meters near crewed habitats.',
+    choices: [
+      {
+        id: 'boost-landing-beacon',
+        label: 'Overdrive Landing Radar Beacon',
+        summary: 'Spend battery power to lock a pinpoint touchdown right beside Jezero Base.',
+        tradeoffHint: '-12 kWh Power · +4% Crew Morale · +10 Science',
+        effects: { powerKwh: -12, lifeSupportPct: 0, crewHealthPct: 4, dustDelta: 0, sciencePoints: 10 },
+      },
+      {
+        id: 'passive-optical-guide',
+        label: 'Use Passive Optical Markers',
+        summary: 'Conserve battery and O₂ reserves for final crew extraction prep.',
+        tradeoffHint: '+6 kWh Power · +4% Life Support · +4 Science',
+        effects: { powerKwh: 6, lifeSupportPct: 4, crewHealthPct: 0, dustDelta: 0, sciencePoints: 4 },
+      },
+    ],
+  },
 ];

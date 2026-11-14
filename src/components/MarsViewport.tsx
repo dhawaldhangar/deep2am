@@ -1,8 +1,10 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Shield, Sparkles, Sprout, Wind, Zap } from 'lucide-react';
 import { ModuleId, SolHazardType } from '../data/campaignArc';
-import { MissionResources } from '../game/simulation';
+import { MissionResources, SolAtmosphereTargets } from '../game/simulation';
 import {
+  ActiveSystemGlow,
+  DonkiSceneTelemetry,
   EmergencyMode,
   MarsOutpostScene,
   ProjectedModuleAnchor,
@@ -20,7 +22,8 @@ export interface MarsViewportHandle {
   triggerNightCycle: (
     hazardType: SolHazardType,
     shieldBlockedFlare: boolean,
-    onComplete: () => void
+    onComplete: () => void,
+    durationSec?: number
   ) => void;
 }
 
@@ -29,6 +32,11 @@ interface MarsViewportProps {
   tau: number;
   targetModule: ModuleId | 'any';
   emergencyMode: EmergencyMode;
+  atmosphere: SolAtmosphereTargets;
+  hazardType: SolHazardType;
+  activeSystemGlow: ActiveSystemGlow;
+  donkiTelemetry: DonkiSceneTelemetry;
+  speedMultiplier: number;
   isNightCycle: boolean;
   disabled: boolean;
   activePopup: ModulePopup | null;
@@ -82,6 +90,11 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       tau,
       targetModule,
       emergencyMode,
+      atmosphere,
+      hazardType,
+      activeSystemGlow,
+      donkiTelemetry,
+      speedMultiplier,
       isNightCycle,
       disabled,
       activePopup,
@@ -106,8 +119,8 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       triggerModulePulse: (moduleId: ModuleId) => {
         sceneRef.current?.triggerModuleFeedback(moduleId);
       },
-      triggerNightCycle: (hazardType, shieldBlockedFlare, onComplete) => {
-        sceneRef.current?.triggerNightCycle(hazardType, shieldBlockedFlare, onComplete);
+      triggerNightCycle: (hazardType, shieldBlockedFlare, onComplete, durationSec) => {
+        sceneRef.current?.triggerNightCycle(hazardType, shieldBlockedFlare, onComplete, durationSec);
       },
     }));
 
@@ -140,8 +153,24 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
     }, []);
 
     useEffect(() => {
-      sceneRef.current?.updateMissionVisuals(resources, tau, targetModule, emergencyMode);
-    }, [resources, tau, targetModule, emergencyMode]);
+      sceneRef.current?.updateMissionVisuals(resources, tau, targetModule, emergencyMode, {
+        atmosphere,
+        hazardType,
+        activeSystemGlow,
+        speedMultiplier,
+        donki: donkiTelemetry,
+      });
+    }, [
+      resources,
+      tau,
+      targetModule,
+      emergencyMode,
+      atmosphere,
+      hazardType,
+      activeSystemGlow,
+      speedMultiplier,
+      donkiTelemetry,
+    ]);
 
     const getDynamicStatus = (id: ModuleId): string => {
       if (id === 'solar') return `Dust ${resources.panelDustPct}%`;
@@ -204,29 +233,37 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
                     data-testid={`hotspot-${anchor.id}`}
                     disabled={disabled}
                     onClick={() => onModuleAction(anchor.id)}
-                    aria-label={`${meta.name}: ${meta.actionLabel} (${meta.tradeoffShort})`}
-                    className={`group flex flex-col items-center gap-0.5 px-2 py-1 sm:px-2.5 sm:py-1.5 rounded-xl bg-[#0B1220]/92 border text-left transition-transform cursor-pointer shadow-lg focus-visible:outline-2 focus-visible:outline-cyan-300 ${
-                      isTarget
-                        ? 'border-cyan-400 ring-2 ring-cyan-400/35 -translate-y-0.5'
-                        : isHovered
-                        ? 'border-amber-300 -translate-y-0.5'
-                        : meta.accentClass
+                    aria-label={`${meta.name}: ${meta.actionLabel} (${getDynamicStatus(anchor.id)} · ${meta.tradeoffShort})`}
+                    className={`group relative flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-left transition-all duration-150 cursor-pointer shadow-md focus-visible:outline-2 focus-visible:outline-cyan-300 ${
+                      isHovered
+                        ? 'bg-[#0B1220] opacity-100 -translate-y-0.5 border-amber-300 shadow-lg'
+                        : isTarget
+                        ? 'bg-[#070B14]/70 opacity-80 hover:opacity-100 hover:bg-[#0B1220] focus-visible:opacity-100 focus-visible:bg-[#0B1220] border-cyan-400/85 ring-1 ring-cyan-400/35 hover:-translate-y-0.5'
+                        : `bg-[#070B14]/65 opacity-70 hover:opacity-100 hover:bg-[#0B1220] focus-visible:opacity-100 focus-visible:bg-[#0B1220] hover:-translate-y-0.5 ${meta.accentClass}`
                     }`}
                   >
-                    <div className="flex items-center gap-1 sm:gap-1.5">
-                      <Icon className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                      <span className="text-[11px] sm:text-xs font-bold text-white whitespace-nowrap">
-                        {meta.actionLabel}
+                    <Icon className="w-3 h-3 shrink-0" aria-hidden="true" />
+                    <span className="text-[11px] font-semibold tracking-tight text-white whitespace-nowrap">
+                      {meta.actionLabel}
+                    </span>
+                    {isTarget && (
+                      <Sparkles className="w-2.5 h-2.5 text-cyan-300 shrink-0" aria-hidden="true" />
+                    )}
+
+                    {/* Compact hover/focus detail chip */}
+                    {!hasPopup && (
+                      <span
+                        className={`pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 px-2 py-0.5 rounded-md bg-[#0B1220] border border-slate-700/90 text-[10px] font-mono text-slate-200 whitespace-nowrap shadow-lg transition-opacity duration-150 ${
+                          isHovered
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100'
+                        }`}
+                      >
+                        <span>{getDynamicStatus(anchor.id)}</span>
+                        <span className="text-slate-500 mx-1">·</span>
+                        <span className="text-cyan-300">{meta.tradeoffShort}</span>
                       </span>
-                      {isTarget && (
-                        <Sparkles className="w-3 h-3 text-cyan-300 shrink-0" aria-hidden="true" />
-                      )}
-                    </div>
-                    <div className="hidden sm:flex items-center gap-1.5 text-[10px] font-mono text-slate-300 whitespace-nowrap">
-                      <span>{getDynamicStatus(anchor.id)}</span>
-                      <span className="text-slate-500">·</span>
-                      <span className="text-cyan-300">{meta.tradeoffShort}</span>
-                    </div>
+                    )}
                   </button>
                 </div>
               );

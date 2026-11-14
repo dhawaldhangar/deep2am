@@ -39,9 +39,12 @@ export const DilemmaModal: React.FC<DilemmaModalProps> = ({
   onChoose,
   onOpenScienceLog,
 }) => {
+  const tacticalChoices = dilemma.choices.slice(0, 2);
+
   return (
     <div
       role="dialog"
+      data-testid="dilemma-modal"
       aria-modal="true"
       aria-labelledby="dilemma-title"
       className="fixed inset-0 z-40 bg-slate-950/80 flex items-center justify-center p-4"
@@ -49,7 +52,7 @@ export const DilemmaModal: React.FC<DilemmaModalProps> = ({
       <div className="w-full max-w-2xl bg-[#0F172A] border border-slate-700 rounded-2xl p-6 shadow-2xl">
         <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <span className="text-xs font-mono uppercase tracking-wider text-amber-400">
-            Sol {sol} Mission Dilemma
+            Phase 1 · Sol {sol} Tactical Decision (2 Cards)
           </span>
           <button
             type="button"
@@ -77,10 +80,11 @@ export const DilemmaModal: React.FC<DilemmaModalProps> = ({
         </div>
 
         <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-          {dilemma.choices.map((choice) => (
+          {tacticalChoices.map((choice, idx) => (
             <button
               key={choice.id}
               type="button"
+              data-testid="dilemma-choice-card"
               onClick={() => {
                 missionAudio.playClick();
                 onChoose(choice);
@@ -88,6 +92,9 @@ export const DilemmaModal: React.FC<DilemmaModalProps> = ({
               className="text-left p-4 rounded-xl bg-[#0B1220] hover:bg-slate-800/90 border border-slate-700 hover:border-cyan-400 transition-colors cursor-pointer flex flex-col justify-between gap-3 focus-visible:outline-2 focus-visible:outline-cyan-400"
             >
               <div>
+                <span className="inline-block text-[10px] font-mono uppercase tracking-wider text-cyan-400 mb-1">
+                  Tactical Card {idx + 1}
+                </span>
                 <h3 className="text-base font-semibold text-white">{choice.label}</h3>
                 <p className="mt-1.5 text-xs sm:text-sm text-slate-300 leading-relaxed">
                   {choice.summary}
@@ -99,6 +106,10 @@ export const DilemmaModal: React.FC<DilemmaModalProps> = ({
             </button>
           ))}
         </div>
+
+        <p className="mt-4 text-[11px] font-mono text-slate-400 text-center">
+          Selecting a card locks in your directive as the 5-minute Sol timeline progresses. Fast Forward unlocks at 02:00.
+        </p>
       </div>
     </div>
   );

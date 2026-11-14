@@ -7,10 +7,127 @@ import {
   NasaFlareRecord,
   VERIFIED_FALLBACK_FLARES,
 } from '../data/nasaTelemetry';
-import { CAMPAIGN_CHAPTERS, ModuleId, SolCampaignChapter } from '../data/campaignArc';
+import {
+  CAMPAIGN_CHAPTERS,
+  ModuleId,
+  SolCampaignChapter,
+  SolHazardType,
+} from '../data/campaignArc';
 
 export const MAX_SOLS = 10;
 export const MAX_BATTERY_KWH = 120;
+export const MARTIAN_DUST_HEX = 0xd97736;
+export const SOL_DURATION_SEC = 300; // 5 minutes per Sol
+export const OPERATION_DURATION_SEC = SOL_DURATION_SEC;
+export const FAST_FORWARD_UNLOCK_SEC = 120; // Fast Forward strictly locked for first 2 minutes
+export const FAST_FORWARD_MULTIPLIER = 5; // 5x simulation speed once unlocked
+
+export type AtmosphereAlertMode = 'none' | 'dust' | 'flare';
+export type SolOperationalPhase =
+  | 'crisis_brief'
+  | 'decision_cards'
+  | 'operation'
+  | 'sol_complete';
+
+export interface SolAtmosphereTargets {
+  solProgress: number; // 0..1
+  crisisIntensity: number; // 0..1
+  effectiveTau: number;
+  fogDensity: number;
+  sunElevation: number; // 0..1 (1 = midday high, 0 = twilight)
+  nightFactor: number; // 0..1
+}
+
+function smoothstep01(edge0: number, edge1: number, x: number): number {
+  const t = clamp((x - edge0) / Math.max(0.0001, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Maps the in-game MEDA Tau dust opacity index (and active emergency state)
+ * to Three.js FogExp2 density, anchored at 0.015 for clear Martian morning air.
+ */
+export function computeTauFogDensity(
+  tau: number,
+  emergencyMode: AtmosphereAlertMode = 'none'
+): number {
+  const safeTau = Number.isFinite(tau) ? tau : 0.35;
+  const tauExcess = Math.max(0, safeTau - 0.35);
+  let density = 0.015 + tauExcess * 0.016;
+  if (emergencyMode === 'dust') {
+    density = Math.max(density, 0.026);
+  } else if (emergencyMode === 'flare') {
+    density = Math.max(density, 0.0205);
+  }
+  return clamp(Number(density.toFixed(5)), 0.015, 0.045);
+}
+
+/**
+ * Computes continuous, non-snapping atmospheric targets across the 300-second Sol timeline:
+ * - 0:00 Early Phase: gradual buildup toward the upcoming weather/crisis state
+ * - Decision Trigger & Peak Phase: ramps smoothly to peak intensity after choice lock-in
+ * - Stabilization & Dusk: gradually stabilizes as the player's directive takes effect
+ */
+export function computeSolAtmosphereTargets(params: {
+  elapsedSec: number;
+  durationSec?: number;
+  decisionElapsedSec: number | null;
+  baseTau: number;
+  hazardType: SolHazardType;
+  emergencyMode: AtmosphereAlertMode;
+}): SolAtmosphereTargets {
+  const duration = Math.max(1, params.durationSec ?? SOL_DURATION_SEC);
+  const solProgress = clamp(params.elapsedSec / duration, 0, 1);
+
+  let crisisIntensity: number;
+  if (params.decisionElapsedSec === null) {
+    // 0:00 -> Early Phase & Decision Trigger: environment shifts slowly upward as problem builds
+    crisisIntensity = 0.12 + smoothstep01(0, 0.4, solProgress) * 0.62;
+  } else {
+    const decisionProg = clamp(params.decisionElapsedSec / duration, 0, 0.9);
+    const postSpan = Math.max(0.1, 1 - decisionProg);
+    const postProgress = clamp((solProgress - decisionProg) / postSpan, 0, 1);
+    const entryIntensity = 0.12 + smoothstep01(0, 0.4, decisionProg) * 0.62;
+
+    if (postProgress < 0.22) {
+      // Peak Phase: ramps smoothly from decision moment to full crisis peak (1.0)
+      const ramp = smoothstep01(0, 0.22, postProgress);
+      crisisIntensity = entryIntensity + (1.0 - entryIntensity) * ramp;
+    } else {
+      // Stabilization Phase: eases down as the chosen directive & crew actions take effect
+      const stabilize = smoothstep01(0.22, 1.0, postProgress);
+      crisisIntensity = 1.0 - stabilize * 0.72;
+    }
+  }
+
+  // Smooth solar elevation & twilight arc over the 5-minute Sol
+  const twilightBell = Math.exp(-Math.pow((solProgress - 0.84) / 0.16, 2));
+  const nightFactor = clamp(twilightBell * 0.85, 0, 0.85);
+  const sunElevation = clamp(1 - nightFactor * 0.88 - crisisIntensity * 0.15, 0.1, 1);
+
+  const hazardTauBoost =
+    params.hazardType === 'dust'
+      ? 0.35
+      : params.hazardType === 'flare'
+      ? 0.16
+      : 0.08;
+  const effectiveTau = Number((params.baseTau + crisisIntensity * hazardTauBoost).toFixed(3));
+  const baseFog = computeTauFogDensity(effectiveTau, params.emergencyMode);
+  const fogDensity = clamp(
+    Number((baseFog + crisisIntensity * (params.hazardType === 'dust' ? 0.008 : 0.003)).toFixed(5)),
+    0.015,
+    0.045
+  );
+
+  return {
+    solProgress,
+    crisisIntensity: clamp(crisisIntensity, 0, 1),
+    effectiveTau,
+    fogDensity,
+    sunElevation,
+    nightFactor,
+  };
+}
 
 export interface MissionResources {
   powerKwh: number; // 0..120
@@ -20,6 +137,23 @@ export interface MissionResources {
   waterWallCm: number; // 8..36
   cropGrowth: number; // 1..5
   sciencePoints: number;
+}
+
+export interface ExactResources {
+  powerKwh: number;
+  lifeSupportPct: number;
+  crewHealthPct: number;
+  panelDustPct: number;
+}
+
+export interface OperationRates {
+  powerPerSec: number;
+  lifePerSec: number;
+  healthPerSec: number;
+  dustPerSec: number;
+  tauShift: number;
+  radDoseMsv: number;
+  shieldBlockedFlare: boolean;
 }
 
 export interface ModuleActionResult {
@@ -67,7 +201,17 @@ export interface DebriefReport {
 
 export interface MissionState {
   sol: number;
+  opPhase: SolOperationalPhase;
+  operationElapsedSec: number;
+  operationDurationSec: number;
+  decisionElapsedSec: number | null;
+  fastForwardUnlocked: boolean;
+  fastForwardActive: boolean;
+  speedMultiplier: number;
+  lockedChoice: DilemmaChoice | null;
+  operationRates: OperationRates | null;
   resources: MissionResources;
+  exactResources: ExactResources;
   weather: MedaSolWeather;
   activeFlare: NasaFlareRecord;
   pendingDilemma: DilemmaEvent | null;
@@ -87,7 +231,7 @@ export function getSolChapter(sol: number): SolCampaignChapter {
 
 export function getWeatherForSol(sol: number): MedaSolWeather {
   const index = clamp(sol - 1, 0, MEDA_ARCHIVE_SOLS.length - 1);
-  return MEDA_ARCHIVE_SOLS[index];
+  return { ...MEDA_ARCHIVE_SOLS[index] };
 }
 
 export function pickFlareForSol(sol: number, flares: NasaFlareRecord[]): NasaFlareRecord {
@@ -100,27 +244,45 @@ export function createInitialMissionState(
 ): MissionState {
   const weather = getWeatherForSol(1);
   const activeFlare = pickFlareForSol(1, flares);
+  const initialDilemma = selectNextDilemma(1, weather, activeFlare, []);
+  const resources: MissionResources = {
+    powerKwh: 88,
+    lifeSupportPct: 80,
+    crewHealthPct: 88,
+    panelDustPct: 16,
+    waterWallCm: 16,
+    cropGrowth: 2,
+    sciencePoints: 0,
+  };
+
   return {
     sol: 1,
-    resources: {
-      powerKwh: 88,
-      lifeSupportPct: 80,
-      crewHealthPct: 88,
-      panelDustPct: 16,
-      waterWallCm: 16,
-      cropGrowth: 2,
-      sciencePoints: 0,
+    opPhase: 'crisis_brief',
+    operationElapsedSec: 0,
+    operationDurationSec: SOL_DURATION_SEC,
+    decisionElapsedSec: null,
+    fastForwardUnlocked: false,
+    fastForwardActive: false,
+    speedMultiplier: 1,
+    lockedChoice: null,
+    operationRates: null,
+    resources,
+    exactResources: {
+      powerKwh: resources.powerKwh,
+      lifeSupportPct: resources.lifeSupportPct,
+      crewHealthPct: resources.crewHealthPct,
+      panelDustPct: resources.panelDustPct,
     },
     weather,
     activeFlare,
-    pendingDilemma: null,
+    pendingDilemma: initialDilemma,
     usedDilemmaIds: [],
     logs: [
       {
         sol: 1,
         headline: 'Touchdown Confirmed at Jezero Base',
         detail:
-          'All four crew members are inside the habitat. Click any 3D outpost module to manage resources before sunset.',
+          'All four crew members are inside the habitat. Sol 1 atmospheric monitoring is live—open decision cards to lock in your response.',
         nasaSource: `Perseverance ${weather.nasaSourceId}`,
         tone: 'nominal',
       },
@@ -287,7 +449,7 @@ export function performModuleAction(
 }
 
 /**
- * Simulates the Martian night cycle when the player clicks "End Sol & Watch Night Cycle".
+ * Simulates the Martian night cycle summary (used for tests and legacy helper).
  */
 export function calculateNightCycle(
   resources: MissionResources,
@@ -314,9 +476,9 @@ export function calculateNightCycle(
 
   let netCrewHealthPct = -2;
   if (isFlare && !shieldStrong) {
-    netCrewHealthPct = -12; // Unshielded flare breach!
+    netCrewHealthPct = -12;
   } else if (isFlare && shieldStrong) {
-    netCrewHealthPct = -1; // Deflected by water-wall!
+    netCrewHealthPct = -1;
   }
   if (resources.lifeSupportPct < 30) {
     netCrewHealthPct -= 6;
@@ -329,6 +491,73 @@ export function calculateNightCycle(
     netLifeSupportPct,
     netCrewHealthPct,
     netDustPct,
+    radDoseMsv,
+    shieldBlockedFlare,
+  };
+}
+
+export function computeChoiceClimateTauShift(
+  chapter: SolCampaignChapter,
+  choice: DilemmaChoice | null
+): number {
+  let shift = 0;
+  if (chapter.hazardType === 'dust') {
+    shift += 0.12;
+  }
+  if (choice) {
+    if (choice.effects.dustDelta < 0) {
+      shift -= 0.08;
+    } else if (choice.effects.dustDelta > 0) {
+      shift += 0.16;
+    }
+  }
+  return Number(shift.toFixed(2));
+}
+
+export function computeOperationRates(
+  resources: MissionResources,
+  weather: MedaSolWeather,
+  activeFlare: NasaFlareRecord,
+  chapter: SolCampaignChapter,
+  lockedChoice: DilemmaChoice | null
+): OperationRates {
+  const tauFactor = clamp(1 - (weather.tau - 0.35) * 0.4, 0.35, 1.0);
+  const dustFactor = clamp(1 - (resources.panelDustPct / 100) * 0.65, 0.38, 1.0);
+  const solar300 = 45 * tauFactor * dustFactor;
+  const draw300 = chapter.hazardType === 'cold' || weather.tempMinC <= -81 ? 26 : 22;
+
+  const choicePowerBonus300 = lockedChoice ? lockedChoice.effects.powerKwh * 0.2 : 0;
+  const choiceLifeBonus300 = lockedChoice ? lockedChoice.effects.lifeSupportPct * 0.25 : 0;
+
+  const netPower300 = solar300 - draw300 + choicePowerBonus300;
+  const cropO2Bonus = resources.cropGrowth >= 3 ? 2.5 : 0;
+  const netLife300 = -9 + cropO2Bonus + choiceLifeBonus300;
+  const netDust300 = 5 + weather.tau * 7;
+
+  const isFlare = chapter.hazardType === 'flare' || activeFlare.radBoostMsv >= 0.7;
+  const shieldStrong = resources.waterWallCm >= 22;
+  const shieldBlockedFlare = isFlare && shieldStrong;
+
+  const ambientRad = 0.67 + (isFlare ? activeFlare.radBoostMsv : 0.12);
+  const shieldFactor = clamp((resources.waterWallCm - 8) / 28, 0, 1) * 0.72;
+  const radDoseMsv = Number((ambientRad * (1 - shieldFactor)).toFixed(2));
+
+  let netHealth300 = -2;
+  if (isFlare && !shieldStrong) {
+    netHealth300 = -12;
+  } else if (isFlare && shieldStrong) {
+    netHealth300 = -1;
+  }
+  if (resources.lifeSupportPct < 30) {
+    netHealth300 -= 6;
+  }
+
+  return {
+    powerPerSec: netPower300 / SOL_DURATION_SEC,
+    lifePerSec: netLife300 / SOL_DURATION_SEC,
+    healthPerSec: netHealth300 / SOL_DURATION_SEC,
+    dustPerSec: netDust300 / SOL_DURATION_SEC,
+    tauShift: computeChoiceClimateTauShift(chapter, lockedChoice),
     radDoseMsv,
     shieldBlockedFlare,
   };
@@ -356,6 +585,406 @@ export function selectNextDilemma(
     if (radEvent) return radEvent;
   }
   return pool[(sol - 1) % pool.length];
+}
+
+/**
+ * Phase 1 transition: player clicks "Open Decision Cards" to inspect the 2 tactical choices.
+ */
+export function openDecisionCards(state: MissionState): MissionState {
+  if (state.debrief || state.opPhase !== 'crisis_brief' || !state.pendingDilemma) {
+    return state;
+  }
+  return {
+    ...state,
+    opPhase: 'decision_cards',
+  };
+}
+
+/**
+ * Phase 1 -> Phase 2 transition: player locks in 1 of the 2 tactical cards.
+ * Preserves the running 300-second Sol clock so atmospheric interpolation never snaps.
+ */
+export function lockInDecisionChoice(
+  state: MissionState,
+  choice: DilemmaChoice
+): MissionState {
+  if (state.debrief || !state.pendingDilemma) return state;
+  if (state.opPhase !== 'decision_cards' && state.opPhase !== 'crisis_brief') return state;
+
+  const chapter = getSolChapter(state.sol);
+  const tauShift = computeChoiceClimateTauShift(chapter, choice);
+  const shiftedTau = Number(clamp(state.weather.tau + tauShift, 0.25, 2.2).toFixed(2));
+  const nextWeather: MedaSolWeather = {
+    ...state.weather,
+    tau: shiftedTau,
+  };
+
+  const nextExact: ExactResources = {
+    powerKwh: clamp(state.exactResources.powerKwh + choice.effects.powerKwh, 0, MAX_BATTERY_KWH),
+    lifeSupportPct: clamp(
+      state.exactResources.lifeSupportPct + choice.effects.lifeSupportPct,
+      0,
+      100
+    ),
+    crewHealthPct: clamp(
+      state.exactResources.crewHealthPct + choice.effects.crewHealthPct,
+      0,
+      100
+    ),
+    panelDustPct: clamp(state.exactResources.panelDustPct + choice.effects.dustDelta, 0, 85),
+  };
+
+  const updatedResources: MissionResources = {
+    ...state.resources,
+    powerKwh: Math.round(nextExact.powerKwh),
+    lifeSupportPct: Math.round(nextExact.lifeSupportPct),
+    crewHealthPct: Math.round(nextExact.crewHealthPct),
+    panelDustPct: Math.round(nextExact.panelDustPct),
+    sciencePoints: state.resources.sciencePoints + choice.effects.sciencePoints,
+  };
+
+  const defeatReason = checkDefeatReason(updatedResources);
+  if (defeatReason) {
+    const debrief = buildDebriefReport('DEFEAT', defeatReason, state.sol - 1, updatedResources);
+    return {
+      ...state,
+      weather: nextWeather,
+      resources: updatedResources,
+      exactResources: nextExact,
+      lockedChoice: choice,
+      pendingDilemma: null,
+      debrief,
+      logs: [
+        {
+          sol: state.sol,
+          headline: `${choice.label} — System Collapse`,
+          detail: defeatReason,
+          nasaSource: state.pendingDilemma.nasaSourceLabel,
+          tone: 'critical',
+        },
+        ...state.logs,
+      ],
+    };
+  }
+
+  const operationRates = computeOperationRates(
+    updatedResources,
+    nextWeather,
+    state.activeFlare,
+    chapter,
+    choice
+  );
+
+  const unlockedAlready = state.operationElapsedSec >= FAST_FORWARD_UNLOCK_SEC;
+
+  return {
+    ...state,
+    opPhase: 'operation',
+    decisionElapsedSec: state.operationElapsedSec,
+    fastForwardUnlocked: unlockedAlready,
+    fastForwardActive: unlockedAlready ? state.fastForwardActive : false,
+    speedMultiplier: unlockedAlready ? state.speedMultiplier : 1,
+    lockedChoice: choice,
+    operationRates,
+    weather: nextWeather,
+    resources: updatedResources,
+    exactResources: nextExact,
+    usedDilemmaIds: [...state.usedDilemmaIds, state.pendingDilemma.id],
+    logs: [
+      {
+        sol: state.sol,
+        headline: `Sol ${state.sol} Directive Locked: ${choice.label}`,
+        detail: `${choice.summary} (${choice.tradeoffHint}) · Tau ${shiftedTau}`,
+        nasaSource: state.pendingDilemma.nasaSourceLabel,
+        tone:
+          updatedResources.powerKwh < 25 ||
+          updatedResources.lifeSupportPct < 35 ||
+          updatedResources.crewHealthPct < 35
+            ? 'caution'
+            : 'nominal',
+      },
+      ...state.logs,
+    ],
+  };
+}
+
+/**
+ * Continuous 300-second Sol clock tick:
+ * - During Phase 1 (crisis_brief / decision_cards), smoothly advances the early-phase clock
+ *   at 1x up to 119s so the environment builds gradually without unlocking Fast Forward or ending the Sol.
+ * - During Phase 2 (operation), enforces 1x speed until 120s, then unlocks Fast Forward (5x)
+ *   and advances metrics continuously until 300s (sol_complete).
+ */
+export function advanceOperationTick(state: MissionState, realDtSec: number): MissionState {
+  if (state.debrief || realDtSec <= 0) return state;
+
+  if (state.opPhase === 'crisis_brief' || state.opPhase === 'decision_cards') {
+    const preDecisionCap = FAST_FORWARD_UNLOCK_SEC - 1; // 119s
+    if (state.operationElapsedSec >= preDecisionCap) return state;
+    const nextElapsed = Math.min(preDecisionCap, state.operationElapsedSec + realDtSec);
+    return {
+      ...state,
+      operationElapsedSec: nextElapsed,
+    };
+  }
+
+  if (state.opPhase !== 'operation') return state;
+
+  const rates = state.operationRates;
+  if (!rates) return state;
+
+  let current = state;
+  let remainingRealDt = realDtSec;
+
+  // Step 1: Strictly enforce 1x real-time up to the 120s Fast Forward unlock boundary
+  if (current.operationElapsedSec < FAST_FORWARD_UNLOCK_SEC) {
+    const timeToUnlock = FAST_FORWARD_UNLOCK_SEC - current.operationElapsedSec;
+    const step1x = Math.min(remainingRealDt, timeToUnlock);
+    remainingRealDt -= step1x;
+    current = applyOperationStep(current, step1x, false);
+    if (current.debrief) return current;
+  }
+
+  // Step 2: After 120s mark, apply active speedMultiplier (1x or 5x) smoothly up to 300s
+  if (remainingRealDt > 0 && current.opPhase === 'operation') {
+    const multiplier = current.fastForwardUnlocked ? current.speedMultiplier : 1;
+    const scaledDt = remainingRealDt * multiplier;
+    const remainingSol = Math.max(0, current.operationDurationSec - current.operationElapsedSec);
+    const stepScaled = Math.min(scaledDt, remainingSol);
+    if (stepScaled > 0) {
+      current = applyOperationStep(current, stepScaled, true);
+    }
+  }
+
+  return current;
+}
+
+function applyOperationStep(
+  state: MissionState,
+  simDtSec: number,
+  allowUnlock: boolean
+): MissionState {
+  const rates = state.operationRates;
+  if (!rates || simDtSec <= 0) return state;
+
+  const nextElapsed = Math.min(
+    state.operationDurationSec,
+    state.operationElapsedSec + simDtSec
+  );
+
+  const nextExact: ExactResources = {
+    powerKwh: clamp(state.exactResources.powerKwh + rates.powerPerSec * simDtSec, 0, MAX_BATTERY_KWH),
+    lifeSupportPct: clamp(
+      state.exactResources.lifeSupportPct + rates.lifePerSec * simDtSec,
+      0,
+      100
+    ),
+    crewHealthPct: clamp(
+      state.exactResources.crewHealthPct + rates.healthPerSec * simDtSec,
+      0,
+      100
+    ),
+    panelDustPct: clamp(state.exactResources.panelDustPct + rates.dustPerSec * simDtSec, 0, 85),
+  };
+
+  const updatedResources: MissionResources = {
+    ...state.resources,
+    powerKwh: Math.round(nextExact.powerKwh),
+    lifeSupportPct: Math.round(nextExact.lifeSupportPct),
+    crewHealthPct: Math.round(nextExact.crewHealthPct),
+    panelDustPct: Math.round(nextExact.panelDustPct),
+  };
+
+  const defeatReason = checkDefeatReason(updatedResources);
+  if (defeatReason) {
+    const debrief = buildDebriefReport('DEFEAT', defeatReason, state.sol - 1, updatedResources);
+    return {
+      ...state,
+      operationElapsedSec: nextElapsed,
+      resources: updatedResources,
+      exactResources: nextExact,
+      debrief,
+      logs: [
+        {
+          sol: state.sol,
+          headline: `Sol ${state.sol} Operation Failure`,
+          detail: defeatReason,
+          nasaSource: `MEDA ${state.weather.nasaSourceId}`,
+          tone: 'critical',
+        },
+        ...state.logs,
+      ],
+    };
+  }
+
+  const unlocked =
+    state.fastForwardUnlocked ||
+    (allowUnlock ? nextElapsed >= FAST_FORWARD_UNLOCK_SEC : nextElapsed >= FAST_FORWARD_UNLOCK_SEC);
+  const completedSol = nextElapsed >= state.operationDurationSec;
+
+  return {
+    ...state,
+    opPhase: completedSol ? 'sol_complete' : 'operation',
+    operationElapsedSec: nextElapsed,
+    fastForwardUnlocked: unlocked,
+    resources: updatedResources,
+    exactResources: nextExact,
+  };
+}
+
+/**
+ * Unlocks/engages 5x Fast Forward speed multiplier once 120 seconds have elapsed.
+ */
+export function activateFastForward(state: MissionState): MissionState {
+  if (!state.fastForwardUnlocked || state.debrief) return state;
+  return {
+    ...state,
+    fastForwardActive: true,
+    speedMultiplier: FAST_FORWARD_MULTIPLIER,
+  };
+}
+
+/**
+ * Toggles between 1x and 5x speed once Fast Forward is unlocked at 120s.
+ */
+export function toggleFastForward(state: MissionState): MissionState {
+  if (!state.fastForwardUnlocked || state.debrief) return state;
+  const nextActive = !state.fastForwardActive;
+  return {
+    ...state,
+    fastForwardActive: nextActive,
+    speedMultiplier: nextActive ? FAST_FORWARD_MULTIPLIER : 1,
+  };
+}
+
+/**
+ * Applies a 3D outpost module interaction during Phase 2 or Phase 3 and refreshes live rates.
+ */
+export function applyModuleActionToMission(
+  state: MissionState,
+  moduleId: ModuleId
+): { nextState: MissionState; result: ModuleActionResult } {
+  const result = performModuleAction(state.resources, moduleId);
+  if (!result.applied) {
+    return { nextState: state, result };
+  }
+
+  const nextExact: ExactResources = {
+    powerKwh: clamp(state.exactResources.powerKwh + result.deltaPower, 0, MAX_BATTERY_KWH),
+    lifeSupportPct: clamp(state.exactResources.lifeSupportPct + result.deltaLife, 0, 100),
+    crewHealthPct: clamp(state.exactResources.crewHealthPct + result.deltaHealth, 0, 100),
+    panelDustPct: clamp(state.exactResources.panelDustPct + result.deltaDust, 0, 85),
+  };
+
+  const syncedResources: MissionResources = {
+    ...result.nextResources,
+    powerKwh: Math.round(nextExact.powerKwh),
+    lifeSupportPct: Math.round(nextExact.lifeSupportPct),
+    crewHealthPct: Math.round(nextExact.crewHealthPct),
+    panelDustPct: Math.round(nextExact.panelDustPct),
+  };
+
+  const chapter = getSolChapter(state.sol);
+  const nextRates =
+    state.opPhase === 'operation' || state.opPhase === 'sol_complete'
+      ? computeOperationRates(
+          syncedResources,
+          state.weather,
+          state.activeFlare,
+          chapter,
+          state.lockedChoice
+        )
+      : state.operationRates;
+
+  return {
+    nextState: {
+      ...state,
+      resources: syncedResources,
+      exactResources: nextExact,
+      operationRates: nextRates,
+    },
+    result,
+  };
+}
+
+/**
+ * Phase 3 -> Next Sol: Completes the 300s Sol, settles Water-Wall slightly, triggers Victory on Sol 10,
+ * or opens the next Sol's 0:00 Phase 1 Crisis Brief.
+ */
+export function advanceToNextSol(
+  state: MissionState,
+  flares: NasaFlareRecord[]
+): MissionState {
+  if (state.debrief) return state;
+
+  const rates = state.operationRates;
+  const nextWall = clamp(state.resources.waterWallCm - 2, 8, 36);
+  const updatedResources: MissionResources = {
+    ...state.resources,
+    waterWallCm: nextWall,
+    sciencePoints: state.resources.sciencePoints + (rates?.shieldBlockedFlare ? 4 : 2),
+  };
+
+  if (state.sol >= MAX_SOLS) {
+    const debrief = buildDebriefReport('VICTORY', null, MAX_SOLS, updatedResources);
+    return {
+      ...state,
+      resources: updatedResources,
+      pendingDilemma: null,
+      debrief,
+      logs: [
+        {
+          sol: state.sol,
+          headline: 'Sol 10 Complete — Supply Rocket Landed!',
+          detail:
+            'Jezero Base survived the full 10-Sol mission arc and welcomed the automated supply lander.',
+          nasaSource: 'NASA Mars Architecture Mission Log',
+          tone: 'nominal',
+        },
+        ...state.logs,
+      ],
+    };
+  }
+
+  const nextSol = state.sol + 1;
+  const nextWeather = getWeatherForSol(nextSol);
+  const nextFlare = pickFlareForSol(nextSol, flares);
+  const nextDilemma = selectNextDilemma(nextSol, nextWeather, nextFlare, state.usedDilemmaIds);
+
+  return {
+    ...state,
+    sol: nextSol,
+    opPhase: 'crisis_brief',
+    operationElapsedSec: 0,
+    operationDurationSec: SOL_DURATION_SEC,
+    decisionElapsedSec: null,
+    fastForwardUnlocked: false,
+    fastForwardActive: false,
+    speedMultiplier: 1,
+    lockedChoice: null,
+    operationRates: null,
+    resources: updatedResources,
+    weather: nextWeather,
+    activeFlare: nextFlare,
+    pendingDilemma: nextDilemma,
+    logs: [
+      {
+        sol: state.sol,
+        headline: `Sol ${state.sol} Operation Completed`,
+        detail: rates?.shieldBlockedFlare
+          ? `Water-Wall deflected the solar flare! (${rates.radDoseMsv} mSv/Sol)`
+          : `Transitioned smoothly to Sol ${nextSol} morning shift.`,
+        nasaSource: `${state.weather.nasaSourceId} / ${state.activeFlare.id}`,
+        tone:
+          updatedResources.powerKwh < 25 ||
+          updatedResources.lifeSupportPct < 35 ||
+          updatedResources.crewHealthPct < 35
+            ? 'caution'
+            : 'nominal',
+      },
+      ...state.logs,
+    ],
+  };
 }
 
 function gradeFromNumber(score: number): string {
@@ -433,9 +1062,6 @@ export function checkDefeatReason(resources: MissionResources): string | null {
   return null;
 }
 
-/**
- * Applies overnight survival math after the 3D sunset / hazard cycle completes.
- */
 export function resolveNightCycleStep(
   state: MissionState,
   flares: NasaFlareRecord[]
@@ -448,7 +1074,6 @@ export function resolveNightCycleStep(
     chapter
   );
 
-  // Water-wall naturally settles slightly overnight
   const nextWall = clamp(state.resources.waterWallCm - 2, 8, 36);
 
   const updatedResources: MissionResources = {
@@ -503,35 +1128,19 @@ export function resolveNightCycleStep(
     };
   }
 
-  const dilemma = selectNextDilemma(
-    state.sol,
-    state.weather,
-    state.activeFlare,
-    state.usedDilemmaIds
-  );
-
-  return {
-    ...state,
-    resources: updatedResources,
-    pendingDilemma: dilemma,
-    logs: [
-      {
-        sol: state.sol,
-        headline: `Sol ${state.sol} Night Cycle (${summary.netPowerKwh >= 0 ? '+' : ''}${summary.netPowerKwh} kWh)`,
-        detail: summary.shieldBlockedFlare
-          ? `Water-Wall deflected the solar flare! (${summary.radDoseMsv} mSv/Sol)`
-          : `Solar recharge +${summary.solarRechargeKwh} kWh vs ${summary.overnightDrawKwh} kWh overnight heating.`,
-        nasaSource: `${state.weather.nasaSourceId} / ${state.activeFlare.id}`,
-        tone:
-          updatedResources.powerKwh < 25 ||
-          updatedResources.lifeSupportPct < 35 ||
-          updatedResources.crewHealthPct < 35
-            ? 'caution'
-            : 'nominal',
+  return advanceToNextSol(
+    {
+      ...state,
+      resources: updatedResources,
+      exactResources: {
+        powerKwh: updatedResources.powerKwh,
+        lifeSupportPct: updatedResources.lifeSupportPct,
+        crewHealthPct: updatedResources.crewHealthPct,
+        panelDustPct: updatedResources.panelDustPct,
       },
-      ...state.logs,
-    ],
-  };
+    },
+    flares
+  );
 }
 
 export function resolveDilemmaChoice(
@@ -540,64 +1149,9 @@ export function resolveDilemmaChoice(
   flares: NasaFlareRecord[]
 ): MissionState {
   if (!state.pendingDilemma) return state;
-
-  const updatedResources: MissionResources = {
-    powerKwh: clamp(state.resources.powerKwh + choice.effects.powerKwh, 0, MAX_BATTERY_KWH),
-    lifeSupportPct: clamp(state.resources.lifeSupportPct + choice.effects.lifeSupportPct, 0, 100),
-    crewHealthPct: clamp(state.resources.crewHealthPct + choice.effects.crewHealthPct, 0, 100),
-    panelDustPct: clamp(state.resources.panelDustPct + choice.effects.dustDelta, 0, 85),
-    waterWallCm: state.resources.waterWallCm,
-    cropGrowth: state.resources.cropGrowth,
-    sciencePoints: state.resources.sciencePoints + choice.effects.sciencePoints,
-  };
-
-  const defeatReason = checkDefeatReason(updatedResources);
-  if (defeatReason) {
-    const debrief = buildDebriefReport('DEFEAT', defeatReason, state.sol, updatedResources);
-    return {
-      ...state,
-      resources: updatedResources,
-      pendingDilemma: null,
-      debrief,
-      logs: [
-        {
-          sol: state.sol,
-          headline: `${choice.label} — System Collapse`,
-          detail: defeatReason,
-          nasaSource: state.pendingDilemma.nasaSourceLabel,
-          tone: 'critical',
-        },
-        ...state.logs,
-      ],
-    };
-  }
-
-  const nextSol = state.sol + 1;
-  const nextWeather = getWeatherForSol(nextSol);
-  const nextFlare = pickFlareForSol(nextSol, flares);
-
-  return {
-    ...state,
-    sol: nextSol,
-    resources: updatedResources,
-    weather: nextWeather,
-    activeFlare: nextFlare,
-    pendingDilemma: null,
-    usedDilemmaIds: [...state.usedDilemmaIds, state.pendingDilemma.id],
-    logs: [
-      {
-        sol: state.sol,
-        headline: `Decision: ${choice.label}`,
-        detail: `${choice.summary} (${choice.tradeoffHint})`,
-        nasaSource: state.pendingDilemma.nasaSourceLabel,
-        tone:
-          updatedResources.powerKwh < 25 ||
-          updatedResources.lifeSupportPct < 35 ||
-          updatedResources.crewHealthPct < 35
-            ? 'caution'
-            : 'nominal',
-      },
-      ...state.logs,
-    ],
-  };
+  const locked = lockInDecisionChoice(state, choice);
+  if (locked.debrief) return locked;
+  const completed = advanceOperationTick(locked, SOL_DURATION_SEC);
+  if (completed.debrief) return completed;
+  return advanceToNextSol(completed, flares);
 }
