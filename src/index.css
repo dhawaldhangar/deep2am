@@ -283,6 +283,16 @@ input[type="range"].mars-slider.slider-cyan::-webkit-slider-thumb {
   animation: emScanDrift 1.4s linear infinite;
 }
 
+.rover-fhaz-scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(34, 211, 238, 0.08) 0px,
+    rgba(34, 211, 238, 0.08) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
 @media (prefers-reduced-motion: reduce) {
   .anim-bubble,
   .anim-dust,

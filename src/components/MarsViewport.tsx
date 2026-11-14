@@ -1,30 +1,48 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { Shield, Sparkles, Sprout, Wind, Zap } from 'lucide-react';
+import { Bot, Crosshair, Shield, Sparkles, Sprout, Wind, Zap } from 'lucide-react';
 import { ModuleId, SolHazardType } from '../data/campaignArc';
-import { MissionResources, SolAtmosphereTargets } from '../game/simulation';
+import {
+  MissionResources,
+  ROVER_POWER_COST_KWH,
+  ROVER_ROCK_SCIENCE_PTS,
+  SolAtmosphereTargets,
+} from '../game/simulation';
 import {
   ActiveSystemGlow,
   DonkiSceneTelemetry,
   EmergencyMode,
+  InteriorPlayerState,
   MarsOutpostScene,
   ProjectedModuleAnchor,
+  ProjectedRockAnchor,
+  RoverMissionTarget,
+  RoverPhase,
+  SceneViewMode,
+  ScienceBoulderId,
 } from '../three/MarsOutpostScene';
+import { InteriorInteractableId } from '../game/interiorCollision';
 
 export interface ModulePopup {
   id: number;
-  moduleId: ModuleId;
+  moduleId: ModuleId | ScienceBoulderId;
   text: string;
   positive: boolean;
 }
 
 export interface MarsViewportHandle {
   triggerModulePulse: (moduleId: ModuleId) => void;
+  deployRover: (target: RoverMissionTarget) => boolean;
   triggerNightCycle: (
     hazardType: SolHazardType,
     shieldBlockedFlare: boolean,
     onComplete: () => void,
     durationSec?: number
   ) => void;
+  setViewMode: (mode: SceneViewMode) => void;
+  setInteriorInputPaused: (paused: boolean) => void;
+  unlockInteriorPointer: () => void;
+  setVirtualInteriorInput: (input: { forward: number; right: number; turn: number }) => void;
+  triggerInteriorFeedback: (id: InteriorInteractableId) => void;
 }
 
 interface MarsViewportProps {
@@ -40,7 +58,18 @@ interface MarsViewportProps {
   isNightCycle: boolean;
   disabled: boolean;
   activePopup: ModulePopup | null;
+  roverPhase: RoverPhase;
+  analyzedRockIds: ScienceBoulderId[];
+  viewMode: SceneViewMode;
+  highlightDomeInteriorEntry?: boolean;
   onModuleAction: (moduleId: ModuleId) => void;
+  onEnterInterior: () => void;
+  onDeployRover: (target: RoverMissionTarget) => void;
+  onRoverPhaseChange: (phase: RoverPhase, label: string | null) => void;
+  onRoverTaskComplete: (target: RoverMissionTarget) => void;
+  onViewModeChange?: (mode: SceneViewMode) => void;
+  onInteriorStateUpdate?: (state: InteriorPlayerState) => void;
+  onInteriorInteract?: (id: InteriorInteractableId) => void;
 }
 
 const MODULE_META: Record<
@@ -50,6 +79,7 @@ const MODULE_META: Record<
     actionLabel: string;
     tradeoffShort: string;
     accentClass: string;
+    roverTargetLabel?: string;
     icon: React.FC<{ className?: string }>;
   }
 > = {
@@ -58,6 +88,7 @@ const MODULE_META: Record<
     actionLabel: 'Clean Dust',
     tradeoffShort: '+Power · -3% H₂O',
     accentClass: 'border-amber-400/70 text-amber-200 hover:border-amber-300',
+    roverTargetLabel: 'Solar Array Field',
     icon: Zap,
   },
   moxie: {
@@ -65,6 +96,7 @@ const MODULE_META: Record<
     actionLabel: 'Boost O₂',
     tradeoffShort: '+14% O₂ · -12 kWh',
     accentClass: 'border-cyan-400/70 text-cyan-200 hover:border-cyan-300',
+    roverTargetLabel: 'MOXIE Filter Core',
     icon: Wind,
   },
   shelter: {
@@ -98,7 +130,18 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       isNightCycle,
       disabled,
       activePopup,
+      roverPhase,
+      analyzedRockIds,
+      viewMode,
+      highlightDomeInteriorEntry = false,
       onModuleAction,
+      onEnterInterior,
+      onDeployRover,
+      onRoverPhaseChange,
+      onRoverTaskComplete,
+      onViewModeChange,
+      onInteriorStateUpdate,
+      onInteriorInteract,
     },
     ref
   ) => {
@@ -108,19 +151,63 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
     const onActionRef = useRef(onModuleAction);
     onActionRef.current = onModuleAction;
 
+    const onEnterInteriorRef = useRef(onEnterInterior);
+    onEnterInteriorRef.current = onEnterInterior;
+
+    const onDeployRoverRef = useRef(onDeployRover);
+    onDeployRoverRef.current = onDeployRover;
+
+    const onRoverPhaseChangeRef = useRef(onRoverPhaseChange);
+    onRoverPhaseChangeRef.current = onRoverPhaseChange;
+
+    const onRoverTaskCompleteRef = useRef(onRoverTaskComplete);
+    onRoverTaskCompleteRef.current = onRoverTaskComplete;
+
+    const onViewModeChangeRef = useRef(onViewModeChange);
+    onViewModeChangeRef.current = onViewModeChange;
+
+    const onInteriorStateUpdateRef = useRef(onInteriorStateUpdate);
+    onInteriorStateUpdateRef.current = onInteriorStateUpdate;
+
+    const onInteriorInteractRef = useRef(onInteriorInteract);
+    onInteriorInteractRef.current = onInteriorInteract;
+
     const disabledRef = useRef(disabled || isNightCycle);
     disabledRef.current = disabled || isNightCycle;
 
+    const isNightCycleRef = useRef(isNightCycle);
+    isNightCycleRef.current = isNightCycle;
+
     const [anchors, setAnchors] = useState<ProjectedModuleAnchor[]>([]);
+    const [rockAnchors, setRockAnchors] = useState<ProjectedRockAnchor[]>([]);
     const [hoveredId, setHoveredId] = useState<ModuleId | null>(null);
+    const [hoveredRockId, setHoveredRockId] = useState<ScienceBoulderId | null>(null);
     const [webglError, setWebglError] = useState<string | null>(null);
 
     useImperativeHandle(ref, () => ({
       triggerModulePulse: (moduleId: ModuleId) => {
         sceneRef.current?.triggerModuleFeedback(moduleId);
       },
+      deployRover: (target: RoverMissionTarget) => {
+        return sceneRef.current?.deployRover(target) ?? false;
+      },
       triggerNightCycle: (hazardType, shieldBlockedFlare, onComplete, durationSec) => {
         sceneRef.current?.triggerNightCycle(hazardType, shieldBlockedFlare, onComplete, durationSec);
+      },
+      setViewMode: (mode: SceneViewMode) => {
+        sceneRef.current?.setViewMode(mode);
+      },
+      setInteriorInputPaused: (paused: boolean) => {
+        sceneRef.current?.setInteriorInputPaused(paused);
+      },
+      unlockInteriorPointer: () => {
+        sceneRef.current?.unlockInteriorPointer();
+      },
+      setVirtualInteriorInput: (input) => {
+        sceneRef.current?.setVirtualInteriorInput(input);
+      },
+      triggerInteriorFeedback: (id: InteriorInteractableId) => {
+        sceneRef.current?.triggerInteriorFeedback(id);
       },
     }));
 
@@ -130,6 +217,12 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
 
       const controller = new MarsOutpostScene(el, {
         onModuleClick: (moduleId) => {
+          if (moduleId === 'shelter') {
+            if (!isNightCycleRef.current) {
+              onEnterInteriorRef.current();
+            }
+            return;
+          }
           if (!disabledRef.current) {
             onActionRef.current(moduleId);
           }
@@ -139,6 +232,32 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
         },
         onAnchorsUpdate: (next) => {
           setAnchors(next);
+        },
+        onRockClick: (rockId, label) => {
+          if (!disabledRef.current) {
+            onDeployRoverRef.current({ kind: 'rock', rockId, label });
+          }
+        },
+        onHoverRock: (rockId) => {
+          setHoveredRockId(rockId);
+        },
+        onRockAnchorsUpdate: (next) => {
+          setRockAnchors(next);
+        },
+        onRoverPhaseChange: (phase, label) => {
+          onRoverPhaseChangeRef.current(phase, label);
+        },
+        onRoverTaskComplete: (target) => {
+          onRoverTaskCompleteRef.current(target);
+        },
+        onViewModeChange: (mode) => {
+          onViewModeChangeRef.current?.(mode);
+        },
+        onInteriorStateUpdate: (state) => {
+          onInteriorStateUpdateRef.current?.(state);
+        },
+        onInteriorInteract: (id) => {
+          onInteriorInteractRef.current?.(id);
         },
         onWebglError: (reason) => {
           setWebglError(reason);
@@ -179,6 +298,9 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       return `Crop Lv.${resources.cropGrowth}`;
     };
 
+    const roverBusy = roverPhase !== 'idle';
+    const insufficientRoverPower = resources.powerKwh < ROVER_POWER_COST_KWH;
+
     return (
       <div className="fixed inset-0 overflow-hidden bg-[#1D0F0C]" data-testid="mars-3d-viewport">
         {/* Isolated WebGL Canvas Container */}
@@ -193,8 +315,8 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
           </div>
         )}
 
-        {/* Projected On-Object 3D Module Hotspots */}
-        {!isNightCycle && !webglError && (
+        {/* Projected On-Object 3D Module & Science Boulder Hotspots (Exterior View Only) */}
+        {viewMode === 'exterior' && !isNightCycle && !webglError && (
           <div className="absolute inset-0 pointer-events-none z-10">
             {anchors.map((anchor) => {
               if (!anchor.visible) return null;
@@ -203,6 +325,8 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
               const isTarget = targetModule === anchor.id;
               const isHovered = hoveredId === anchor.id;
               const hasPopup = activePopup?.moduleId === anchor.id;
+              const supportsRover = anchor.id === 'solar' || anchor.id === 'moxie';
+              const isMainDome = anchor.id === 'shelter';
 
               return (
                 <div
@@ -211,14 +335,14 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
                     left: `${anchor.x}px`,
                     top: `${anchor.y}px`,
                   }}
-                  className="absolute -translate-x-1/2 -translate-y-full pointer-events-auto"
+                  className="absolute -translate-x-1/2 -translate-y-full pointer-events-auto flex flex-col items-center gap-1"
                 >
                   {/* Floating Action Feedback Callout */}
                   {hasPopup && activePopup && (
                     <div
                       key={activePopup.id}
                       data-testid={`module-feedback-${anchor.id}`}
-                      className={`anim-float-pop mb-1.5 px-2.5 py-1 rounded-lg text-[11px] font-mono font-bold text-center whitespace-nowrap border shadow-lg ${
+                      className={`anim-float-pop mb-1 px-2.5 py-1 rounded-lg text-[11px] font-mono font-bold text-center whitespace-nowrap border shadow-lg ${
                         activePopup.positive
                           ? 'bg-[#071F1B] border-emerald-400 text-emerald-200'
                           : 'bg-[#290F14] border-rose-400 text-rose-200'
@@ -226,6 +350,24 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
                     >
                       {activePopup.text}
                     </div>
+                  )}
+
+                  {/* Clickable Main Habitat Dome First-Person Entry Label */}
+                  {isMainDome && (
+                    <button
+                      type="button"
+                      data-testid="enter-interior-dome-btn"
+                      onClick={onEnterInterior}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold whitespace-nowrap shadow-lg cursor-pointer transition-all duration-150 focus-visible:outline-2 focus-visible:outline-cyan-300 ${
+                        highlightDomeInteriorEntry
+                          ? 'bg-[#120A22] border-amber-300 text-amber-100 ring-2 ring-cyan-300/75 -translate-y-0.5'
+                          : isHovered
+                          ? 'bg-[#110B22] border-cyan-300 text-white -translate-y-0.5'
+                          : 'bg-[#0B1220]/90 hover:bg-[#140E26] border-cyan-400/80 text-cyan-100 hover:-translate-y-0.5'
+                      }`}
+                    >
+                      <span>🔍 Enter Habitat Interior (First-Person)</span>
+                    </button>
                   )}
 
                   <button
@@ -265,6 +407,98 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
                       </span>
                     )}
                   </button>
+
+                  {/* Autonomous Rover External Maintenance Dispatch Option (0 Crew Radiation) */}
+                  {supportsRover && (
+                    <button
+                      type="button"
+                      data-testid={`deploy-rover-${anchor.id}`}
+                      disabled={disabled || roverBusy || insufficientRoverPower}
+                      onClick={() =>
+                        onDeployRover({
+                          kind: anchor.id as 'solar' | 'moxie',
+                          moduleId: anchor.id as 'solar' | 'moxie',
+                          label: meta.roverTargetLabel ?? meta.name,
+                        })
+                      }
+                      title="Dispatch autonomous rover with ZERO crew radiation penalty (4s travel + 3s laser work)"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#120A1E]/92 hover:bg-[#1D1132] disabled:opacity-45 disabled:cursor-not-allowed border border-cyan-400/65 text-[10px] font-mono font-semibold text-cyan-200 whitespace-nowrap shadow-md cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-cyan-300"
+                    >
+                      <Bot className="w-2.5 h-2.5 text-fuchsia-300 shrink-0" aria-hidden="true" />
+                      <span>Deploy Rover (-{ROVER_POWER_COST_KWH} kWh)</span>
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Clickable Science Boulders */}
+            {rockAnchors.map((rock) => {
+              if (!rock.visible) return null;
+              const isHovered = hoveredRockId === rock.id;
+              const isAnalyzed = analyzedRockIds.includes(rock.id);
+              const hasPopup = activePopup?.moduleId === rock.id;
+
+              return (
+                <div
+                  key={rock.id}
+                  style={{
+                    left: `${rock.x}px`,
+                    top: `${rock.y}px`,
+                  }}
+                  className="absolute -translate-x-1/2 -translate-y-full pointer-events-auto flex flex-col items-center"
+                >
+                  {hasPopup && activePopup && (
+                    <div
+                      key={activePopup.id}
+                      data-testid={`rock-feedback-${rock.id}`}
+                      className={`anim-float-pop mb-1 px-2 py-0.5 rounded-lg text-[10px] font-mono font-bold text-center whitespace-nowrap border shadow-lg ${
+                        activePopup.positive
+                          ? 'bg-[#071F1B] border-emerald-400 text-emerald-200'
+                          : 'bg-[#290F14] border-rose-400 text-rose-200'
+                      }`}
+                    >
+                      {activePopup.text}
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    data-testid={`rock-hotspot-${rock.id}`}
+                    disabled={disabled || roverBusy || insufficientRoverPower}
+                    onClick={() =>
+                      onDeployRover({
+                        kind: 'rock',
+                        rockId: rock.id,
+                        label: rock.label,
+                      })
+                    }
+                    aria-label={`Scan ${rock.label} with Rover (-${ROVER_POWER_COST_KWH} kWh, +${ROVER_ROCK_SCIENCE_PTS} Sci Pts)`}
+                    className={`group relative flex items-center gap-1 px-2 py-0.5 rounded-md border text-left transition-all duration-150 cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-2 focus-visible:outline-cyan-300 ${
+                      isHovered
+                        ? 'bg-[#170E24] opacity-100 -translate-y-0.5 border-amber-300 text-amber-100'
+                        : isAnalyzed
+                        ? 'bg-[#0B1220]/75 opacity-75 hover:opacity-100 border-emerald-400/65 text-emerald-200'
+                        : 'bg-[#100918]/80 opacity-80 hover:opacity-100 border-cyan-400/60 text-cyan-100 hover:-translate-y-0.5'
+                    }`}
+                  >
+                    <Crosshair className="w-2.5 h-2.5 text-cyan-300 shrink-0" aria-hidden="true" />
+                    <span className="text-[10px] font-mono font-medium whitespace-nowrap">
+                      {rock.label}
+                    </span>
+
+                    {!hasPopup && (
+                      <span
+                        className={`pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-2 py-0.5 rounded bg-[#0B1220] border border-slate-700 text-[10px] font-mono text-slate-200 whitespace-nowrap shadow-lg transition-opacity duration-150 ${
+                          isHovered
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100'
+                        }`}
+                      >
+                        Deploy Rover (-{ROVER_POWER_COST_KWH} kWh · +{ROVER_ROCK_SCIENCE_PTS} Sci)
+                      </span>
+                    )}
+                  </button>
                 </div>
               );
             })}
@@ -276,3 +510,4 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
 );
 
 MarsViewport.displayName = 'MarsViewport';
+

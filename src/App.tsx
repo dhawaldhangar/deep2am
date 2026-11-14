@@ -26,8 +26,10 @@ import {
   advanceOperationTick,
   advanceToNextSol,
   applyModuleActionToMission,
+  completeRoverTaskOnMission,
   computeSolAtmosphereTargets,
   createInitialMissionState,
+  deployRoverFromMission,
   FAST_FORWARD_MULTIPLIER,
   FAST_FORWARD_UNLOCK_SEC,
   getSolChapter,
@@ -36,23 +38,45 @@ import {
   MAX_SOLS,
   MissionState,
   openDecisionCards,
+  performInteriorBiodomeHarvest,
+  performInteriorMoxieRepair,
   SOL_DURATION_SEC,
   toggleFastForward,
 } from './game/simulation';
+import {
+  getInteriorZoneAt,
+  INTERIOR_SPAWN,
+  InteriorInteractableId,
+} from './game/interiorCollision';
 import {
   computeDonkiVisualState,
   DEFAULT_ARCHIVE_CME,
   DonkiFetchResult,
   fetchNasaDonkiTelemetry,
+  fetchPerseveranceFhazBatch,
+  RoverCameraPhoto,
 } from './utils/nasaApi';
+import roverCamInitialImg from './assets/images/regenerated_image_1794686128270.jpg';
 import { missionAudio } from './utils/audio';
-import { ActiveSystemGlow, DonkiSceneTelemetry, EmergencyMode } from './three/MarsOutpostScene';
+import {
+  ActiveSystemGlow,
+  DonkiSceneTelemetry,
+  EmergencyMode,
+  InteriorPlayerState,
+  RoverMissionTarget,
+  RoverPhase,
+  SceneViewMode,
+  ScienceBoulderId,
+} from './three/MarsOutpostScene';
 import { TitleScreen } from './components/TitleScreen';
 import { MarsViewport, MarsViewportHandle, ModulePopup } from './components/MarsViewport';
 import { CharacterPortrait } from './components/CharacterPortrait';
 import { ScienceTermButton } from './components/ScienceTermButton';
 import { EarthDispatchDrawer } from './components/EarthDispatchDrawer';
 import { DonkiInspectorCard } from './components/DonkiInspectorCard';
+import { RoverCamWidget } from './components/RoverCamWidget';
+import { InteriorHudOverlay } from './components/InteriorHudOverlay';
+import { RoverTerminalModal } from './components/RoverTerminalModal';
 import {
   DebriefModal,
   DilemmaModal,
@@ -74,6 +98,16 @@ const INITIAL_USAGE: ModuleUsageCounts = {
   moxie: 0,
   shelter: 0,
   biodome: 0,
+};
+
+const INITIAL_ROVER_PHOTO: RoverCameraPhoto = {
+  id: 0,
+  sol: 1,
+  imgSrc: roverCamInitialImg,
+  earthDate: '2021-02-19',
+  cameraName: 'FRONT_HAZCAM_LEFT_A',
+  cameraFullName: 'Front Hazard Avoidance Camera - Left (Jezero Archive)',
+  sourceMode: 'LOCAL_ARCHIVE',
 };
 
 function formatMmSs(totalSeconds: number): string {
@@ -121,12 +155,47 @@ export default function App() {
   const [activeTerm, setActiveTerm] = useState<ScienceTerm | null>(null);
   const [activePopup, setActivePopup] = useState<ModulePopup | null>(null);
   const [hudDeltas, setHudDeltas] = useState<HudDeltas | null>(null);
+  const [roverPhase, setRoverPhase] = useState<RoverPhase>('idle');
+  const [roverTargetLabel, setRoverTargetLabel] = useState<string | null>(null);
+  const [roverPhoto, setRoverPhoto] = useState<RoverCameraPhoto | null>(INITIAL_ROVER_PHOTO);
+  const [roverPhotoHistory, setRoverPhotoHistory] = useState<RoverCameraPhoto[]>([
+    INITIAL_ROVER_PHOTO,
+  ]);
+  const [roverPhotoLoading, setRoverPhotoLoading] = useState(false);
+  const [roverCamCollapsed, setRoverCamCollapsed] = useState(false);
+  const [analyzedRockIds, setAnalyzedRockIds] = useState<ScienceBoulderId[]>([]);
+
+  // First-Person Habitat Interior Mode state
+  const [viewMode, setViewMode] = useState<SceneViewMode>('exterior');
+  const [viewFadeActive, setViewFadeActive] = useState(false);
+  const [roverTerminalOpen, setRoverTerminalOpen] = useState(false);
+  const [interiorStatusBanner, setInteriorStatusBanner] = useState<{
+    id: number;
+    text: string;
+    positive: boolean;
+  } | null>(null);
+  const [interiorState, setInteriorState] = useState<InteriorPlayerState>(() => ({
+    zone: getInteriorZoneAt(INTERIOR_SPAWN.x, INTERIOR_SPAWN.z),
+    nearestInteractable: null,
+    pointerLocked: false,
+  }));
 
   const viewportRef = useRef<MarsViewportHandle | null>(null);
   const popupTimerRef = useRef<number | null>(null);
   const deltaTimerRef = useRef<number | null>(null);
   const shieldTimerRef = useRef<number | null>(null);
+  const viewFadeTimerRef = useRef<number | null>(null);
+  const interiorBannerTimerRef = useRef<number | null>(null);
+  const sol10TriggeredRef = useRef(false);
   const prevOpPhaseRef = useRef(mission.opPhase);
+  const missionRef = useRef(mission);
+  missionRef.current = mission;
+  const roverPhaseRef = useRef(roverPhase);
+  roverPhaseRef.current = roverPhase;
+  const roverPhotoHistoryRef = useRef(roverPhotoHistory);
+  roverPhotoHistoryRef.current = roverPhotoHistory;
+  const isNightCycleRef = useRef(isNightCycle);
+  isNightCycleRef.current = isNightCycle;
 
   const clearTimers = useCallback(() => {
     if (popupTimerRef.current !== null) {
@@ -140,6 +209,14 @@ export default function App() {
     if (shieldTimerRef.current !== null) {
       window.clearTimeout(shieldTimerRef.current);
       shieldTimerRef.current = null;
+    }
+    if (viewFadeTimerRef.current !== null) {
+      window.clearTimeout(viewFadeTimerRef.current);
+      viewFadeTimerRef.current = null;
+    }
+    if (interiorBannerTimerRef.current !== null) {
+      window.clearTimeout(interiorBannerTimerRef.current);
+      interiorBannerTimerRef.current = null;
     }
   }, []);
 
@@ -302,21 +379,24 @@ export default function App() {
     prevOpPhaseRef.current = mission.opPhase;
   }, [mission.opPhase]);
 
-  const showModulePopup = useCallback((moduleId: ModuleId, text: string, positive: boolean) => {
-    if (popupTimerRef.current !== null) {
-      window.clearTimeout(popupTimerRef.current);
-    }
-    setActivePopup({
-      id: Date.now() + Math.random(),
-      moduleId,
-      text,
-      positive,
-    });
-    popupTimerRef.current = window.setTimeout(() => {
-      setActivePopup(null);
-      popupTimerRef.current = null;
-    }, 3200);
-  }, []);
+  const showModulePopup = useCallback(
+    (moduleId: ModuleId | ScienceBoulderId, text: string, positive: boolean) => {
+      if (popupTimerRef.current !== null) {
+        window.clearTimeout(popupTimerRef.current);
+      }
+      setActivePopup({
+        id: Date.now() + Math.random(),
+        moduleId,
+        text,
+        positive,
+      });
+      popupTimerRef.current = window.setTimeout(() => {
+        setActivePopup(null);
+        popupTimerRef.current = null;
+      }, 3200);
+    },
+    []
+  );
 
   const showHudDeltaBadges = useCallback((power: number, life: number, health: number) => {
     if (deltaTimerRef.current !== null) {
@@ -334,8 +414,49 @@ export default function App() {
     }, 3200);
   }, []);
 
+  const showInteriorBanner = useCallback((text: string, positive: boolean) => {
+    if (interiorBannerTimerRef.current !== null) {
+      window.clearTimeout(interiorBannerTimerRef.current);
+    }
+    setInteriorStatusBanner({ id: Date.now() + Math.random(), text, positive });
+    interiorBannerTimerRef.current = window.setTimeout(() => {
+      setInteriorStatusBanner(null);
+      interiorBannerTimerRef.current = null;
+    }, 3200);
+  }, []);
+
+  const transitionViewMode = useCallback((nextMode: SceneViewMode) => {
+    if (viewFadeTimerRef.current !== null) {
+      window.clearTimeout(viewFadeTimerRef.current);
+    }
+    setViewFadeActive(true);
+    viewFadeTimerRef.current = window.setTimeout(() => {
+      viewportRef.current?.setViewMode(nextMode);
+      setViewMode(nextMode);
+      viewFadeTimerRef.current = window.setTimeout(() => {
+        setViewFadeActive(false);
+        viewFadeTimerRef.current = null;
+      }, 210);
+    }, 180);
+  }, []);
+
+  const enterInteriorMode = useCallback(() => {
+    if (isNightCycleRef.current || missionRef.current.debrief) return;
+    missionAudio.playShieldSurge();
+    setDispatchOpen(false);
+    setDonkiFeedOpen(false);
+    transitionViewMode('interior');
+  }, [transitionViewMode]);
+
+  const exitInteriorMode = useCallback(() => {
+    missionAudio.playClick();
+    setRoverTerminalOpen(false);
+    transitionViewMode('exterior');
+  }, [transitionViewMode]);
+
   const startMission = useCallback(() => {
     clearTimers();
+    sol10TriggeredRef.current = false;
     setMission(createInitialMissionState(donkiResult.flares));
     setModuleUsage(INITIAL_USAGE);
     setDecryptedSols([]);
@@ -345,10 +466,40 @@ export default function App() {
     setIsNightCycle(false);
     setActivePopup(null);
     setHudDeltas(null);
+    setRoverPhase('idle');
+    setRoverTargetLabel(null);
+    setRoverPhoto(INITIAL_ROVER_PHOTO);
+    setRoverPhotoHistory([INITIAL_ROVER_PHOTO]);
+    setRoverPhotoLoading(false);
+    setAnalyzedRockIds([]);
+    setRoverTerminalOpen(false);
+    setInteriorStatusBanner(null);
+    setViewFadeActive(false);
+    setViewMode('exterior');
+    viewportRef.current?.setViewMode('exterior');
     setPhase('playing');
     setShowScienceLog(false);
     setActiveTerm(null);
   }, [clearTimers, donkiResult.flares]);
+
+  // Auto-trigger / highlight interior transition upon surviving to Sol 10
+  useEffect(() => {
+    if (
+      phase === 'playing' &&
+      mission.sol === MAX_SOLS &&
+      !mission.debrief &&
+      !sol10TriggeredRef.current
+    ) {
+      sol10TriggeredRef.current = true;
+      if (viewMode === 'exterior') {
+        enterInteriorMode();
+      }
+      showInteriorBanner(
+        'Sol 10 Milestone — Welcome inside Jezero Command Habitat!',
+        true
+      );
+    }
+  }, [phase, mission.sol, mission.debrief, viewMode, enterInteriorMode, showInteriorBanner]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -359,15 +510,33 @@ export default function App() {
         return;
       }
       if (e.key === 'Escape') {
-        if (activeTerm) setActiveTerm(null);
+        if (roverTerminalOpen) setRoverTerminalOpen(false);
+        else if (activeTerm) setActiveTerm(null);
         else if (showScienceLog) setShowScienceLog(false);
         else if (donkiFeedOpen) setDonkiFeedOpen(false);
         else if (dispatchOpen) setDispatchOpen(false);
+        else if (viewMode === 'interior' && !interiorState.pointerLocked) {
+          exitInteriorMode();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [phase, activeTerm, showScienceLog, donkiFeedOpen, dispatchOpen, startMission]);
+  }, [
+    phase,
+    roverTerminalOpen,
+    activeTerm,
+    showScienceLog,
+    donkiFeedOpen,
+    dispatchOpen,
+    viewMode,
+    interiorState.pointerLocked,
+    exitInteriorMode,
+    startMission,
+  ]);
+
+  const isSolarFlareActive =
+    emergencyMode === 'flare' || donkiVisualState.level !== 'quiet';
 
   const handleModuleAction = useCallback(
     (moduleId: ModuleId) => {
@@ -379,7 +548,9 @@ export default function App() {
         return;
       }
 
-      const { nextState, result } = applyModuleActionToMission(mission, moduleId);
+      const { nextState, result } = applyModuleActionToMission(mission, moduleId, {
+        flareActive: isSolarFlareActive,
+      });
       if (!result.applied) {
         missionAudio.playWarningKlaxon();
         showModulePopup(moduleId, result.feedbackText, false);
@@ -406,7 +577,192 @@ export default function App() {
       showModulePopup(moduleId, result.feedbackText, true);
       showHudDeltaBadges(result.deltaPower, result.deltaLife, result.deltaHealth);
     },
-    [isNightCycle, mission, showModulePopup, showHudDeltaBadges]
+    [isNightCycle, mission, isSolarFlareActive, showModulePopup, showHudDeltaBadges]
+  );
+
+  const handleDeployRover = useCallback(
+    (target: RoverMissionTarget) => {
+      const current = missionRef.current;
+      if (
+        isNightCycleRef.current ||
+        current.debrief ||
+        roverPhaseRef.current !== 'idle'
+      ) {
+        return;
+      }
+
+      const targetAnchorId = target.kind === 'rock' ? target.rockId : target.moduleId;
+      const dispatch = deployRoverFromMission(current);
+      if (!dispatch.dispatched) {
+        missionAudio.playWarningKlaxon();
+        showModulePopup(targetAnchorId, dispatch.reason ?? 'Need 10 kWh!', false);
+        showInteriorBanner(dispatch.reason ?? 'Need 10 kWh Power to deploy Rover!', false);
+        return;
+      }
+
+      const started = viewportRef.current?.deployRover(target);
+      if (!started) return;
+
+      missionAudio.playRoverDispatch();
+      setMission(dispatch.nextState);
+      showModulePopup(targetAnchorId, `Rover En Route (${target.label})`, true);
+      showInteriorBanner(`Exterior Rover Dispatched -> ${target.label} (-10 kWh)`, true);
+      showHudDeltaBadges(dispatch.deltaPower, 0, 0);
+    },
+    [showModulePopup, showInteriorBanner, showHudDeltaBadges]
+  );
+
+  const handleRefreshRoverFeed = useCallback(() => {
+    const current = missionRef.current;
+    setRoverPhotoLoading(true);
+    const seenIds = roverPhotoHistoryRef.current
+      .filter((p) => p.id > 0)
+      .map((p) => p.id);
+    fetchPerseveranceFhazBatch(current.sol, 'Terminal Downlink', seenIds)
+      .then((batch) => {
+        setRoverPhoto(batch.primary);
+        setRoverPhotoHistory((prev) => {
+          const combined = [batch.primary, ...prev, ...batch.gallery];
+          const unique: RoverCameraPhoto[] = [];
+          const seen = new Set<number>();
+          for (const item of combined) {
+            if (seen.has(item.id)) continue;
+            seen.add(item.id);
+            unique.push(item);
+          }
+          return unique.slice(0, 4);
+        });
+      })
+      .finally(() => {
+        setRoverPhotoLoading(false);
+      });
+  }, []);
+
+  const handleInteriorInteract = useCallback(
+    (id: InteriorInteractableId) => {
+      const current = missionRef.current;
+      if (current.debrief) return;
+
+      if (id === 'airlock_exit') {
+        exitInteriorMode();
+        return;
+      }
+
+      if (id === 'rover_terminal') {
+        viewportRef.current?.unlockInteriorPointer();
+        missionAudio.playClick();
+        setRoverTerminalOpen(true);
+        return;
+      }
+
+      if (id === 'holo_map') {
+        missionAudio.playTelemetryChime();
+        showInteriorBanner(
+          `Jezero Holomap · Sol ${current.sol}/${MAX_SOLS} · Tau ${current.weather.tau.toFixed(2)} · ${current.resources.sciencePoints} Sci Pts`,
+          true
+        );
+        return;
+      }
+
+      if (id === 'moxie_unit') {
+        const outcome = performInteriorMoxieRepair(current);
+        missionAudio.playMoxieTurbine();
+        viewportRef.current?.triggerInteriorFeedback('moxie_unit');
+        setMission(outcome.nextState);
+        setModuleUsage((prev) => ({ ...prev, moxie: prev.moxie + 1 }));
+        showHudDeltaBadges(0, outcome.deltaLife, 0);
+        showInteriorBanner(outcome.feedbackText, true);
+        return;
+      }
+
+      if (id === 'crop_racks') {
+        const outcome = performInteriorBiodomeHarvest(current);
+        missionAudio.playBiodomeMist();
+        viewportRef.current?.triggerInteriorFeedback('crop_racks');
+        setMission(outcome.nextState);
+        setModuleUsage((prev) => ({ ...prev, biodome: prev.biodome + 1 }));
+        showHudDeltaBadges(0, outcome.deltaLife, 0);
+        showInteriorBanner(outcome.feedbackText, true);
+        return;
+      }
+
+      if (id === 'water_tanks') {
+        const { nextState, result } = applyModuleActionToMission(current, 'shelter', {
+          flareActive: false,
+        });
+        if (!result.applied) {
+          missionAudio.playWarningKlaxon();
+          showInteriorBanner(result.feedbackText, false);
+          return;
+        }
+        missionAudio.playShieldSurge();
+        setMission(nextState);
+        setModuleUsage((prev) => ({ ...prev, shelter: prev.shelter + 1 }));
+        showHudDeltaBadges(result.deltaPower, result.deltaLife, result.deltaHealth);
+        showInteriorBanner(result.feedbackText, true);
+      }
+    },
+    [exitInteriorMode, showHudDeltaBadges, showInteriorBanner]
+  );
+
+  const handleRoverPhaseChange = useCallback((nextPhase: RoverPhase, label: string | null) => {
+    setRoverPhase(nextPhase);
+    setRoverTargetLabel(label);
+    if (nextPhase === 'working') {
+      missionAudio.playRoverLaserScan();
+    }
+  }, []);
+
+  const handleRoverTaskComplete = useCallback(
+    (target: RoverMissionTarget) => {
+      const current = missionRef.current;
+      const previewOutcome = completeRoverTaskOnMission(current, target.kind, target.label);
+
+      setMission((prev) => completeRoverTaskOnMission(prev, target.kind, target.label).nextState);
+
+      if (target.kind === 'rock') {
+        const rockId = target.rockId;
+        setAnalyzedRockIds((prev) => (prev.includes(rockId) ? prev : [...prev, rockId]));
+      } else {
+        const modId = target.moduleId;
+        viewportRef.current?.triggerModulePulse(modId);
+        setModuleUsage((prev) => ({ ...prev, [modId]: prev[modId] + 1 }));
+      }
+
+      missionAudio.playTelemetryChime();
+      const targetAnchorId = target.kind === 'rock' ? target.rockId : target.moduleId;
+      showModulePopup(targetAnchorId, previewOutcome.feedbackText, true);
+      showHudDeltaBadges(
+        previewOutcome.deltaPower,
+        previewOutcome.deltaLife,
+        previewOutcome.deltaHealth
+      );
+
+      setRoverPhotoLoading(true);
+      const seenIds = roverPhotoHistoryRef.current
+        .filter((p) => p.id > 0)
+        .map((p) => p.id);
+      fetchPerseveranceFhazBatch(current.sol, target.label, seenIds)
+        .then((batch) => {
+          setRoverPhoto(batch.primary);
+          setRoverPhotoHistory((prev) => {
+            const combined = [batch.primary, ...prev, ...batch.gallery];
+            const unique: RoverCameraPhoto[] = [];
+            const seen = new Set<number>();
+            for (const item of combined) {
+              if (seen.has(item.id)) continue;
+              seen.add(item.id);
+              unique.push(item);
+            }
+            return unique.slice(0, 4);
+          });
+          setRoverCamCollapsed(false);
+        })
+        .finally(() => {
+          setRoverPhotoLoading(false);
+        });
+    },
+    [showModulePopup, showHudDeltaBadges]
   );
 
   const handleOpenDecisionCards = () => {
@@ -475,6 +831,19 @@ export default function App() {
     if (!nextMuted) missionAudio.playClick();
   };
 
+  const isDecisionModalOpen = mission.opPhase === 'decision_cards' && Boolean(mission.pendingDilemma);
+  const modalOpen = Boolean(
+    isDecisionModalOpen ||
+      mission.debrief ||
+      showScienceLog ||
+      activeTerm ||
+      roverTerminalOpen
+  );
+
+  useEffect(() => {
+    viewportRef.current?.setInteriorInputPaused(modalOpen);
+  }, [modalOpen]);
+
   if (phase === 'title') {
     return <TitleScreen onStart={startMission} nasaStatusNote={donkiResult.statusNote} />;
   }
@@ -482,10 +851,6 @@ export default function App() {
   const powerPct = Math.round((mission.exactResources.powerKwh / MAX_BATTERY_KWH) * 100);
   const lifePct = Math.round(mission.exactResources.lifeSupportPct);
   const healthPct = Math.round(mission.exactResources.crewHealthPct);
-  const isDecisionModalOpen = mission.opPhase === 'decision_cards' && Boolean(mission.pendingDilemma);
-  const modalOpen = Boolean(
-    isDecisionModalOpen || mission.debrief || showScienceLog || activeTerm
-  );
   const isEmergency = emergencyMode !== 'none' || donkiVisualState.level === 'x_class';
   const emBorderClass =
     donkiVisualState.level === 'x_class'
@@ -522,7 +887,7 @@ export default function App() {
       data-op-phase={mission.opPhase}
       className="relative w-screen h-screen overflow-hidden bg-[#070B14] text-slate-100 select-none"
     >
-      {/* Full-Screen 3D Mars Outpost */}
+      {/* Full-Screen 3D Mars Outpost (Exterior & Walkable First-Person Interior) */}
       <MarsViewport
         ref={viewportRef}
         resources={mission.resources}
@@ -537,14 +902,33 @@ export default function App() {
         isNightCycle={isNightCycle}
         disabled={modalOpen || isPhase1}
         activePopup={activePopup}
+        roverPhase={roverPhase}
+        analyzedRockIds={analyzedRockIds}
+        viewMode={viewMode}
+        highlightDomeInteriorEntry={mission.sol >= MAX_SOLS}
         onModuleAction={handleModuleAction}
+        onEnterInterior={enterInteriorMode}
+        onDeployRover={handleDeployRover}
+        onRoverPhaseChange={handleRoverPhaseChange}
+        onRoverTaskComplete={handleRoverTaskComplete}
+        onViewModeChange={setViewMode}
+        onInteriorStateUpdate={setInteriorState}
+        onInteriorInteract={handleInteriorInteract}
+      />
+
+      {/* Smooth Airlock Transition Fade Overlay */}
+      <div
+        aria-hidden="true"
+        className={`pointer-events-none fixed inset-0 z-40 bg-[#050811] transition-opacity duration-200 ${
+          viewFadeActive ? 'opacity-100' : 'opacity-0'
+        }`}
       />
 
       {/* Minimal Translucent Top HUD Bar */}
-      <header className="relative z-20 pointer-events-none px-2.5 sm:px-5 pt-2.5">
+      <header className="relative z-20 pointer-events-none px-2.5 sm:px-5 pt-2 sm:pt-2.5">
         <div
           data-testid="top-hud-bar"
-          className={`pointer-events-auto max-w-7xl mx-auto rounded-2xl px-3 sm:px-4 py-2.5 shadow-xl flex flex-col gap-2 border transition-colors ${emBorderClass} ${
+          className={`pointer-events-auto max-w-3xl mx-auto rounded-xl px-2.5 py-1.5 shadow-xl flex flex-col gap-1.5 border transition-colors ${emBorderClass} ${
             isEmergency
               ? 'bg-[#19090E]/92 border-rose-500/80 shadow-[0_0_24px_rgba(239,68,68,0.24)]'
               : donkiVisualState.level === 'm_class'
@@ -553,21 +937,21 @@ export default function App() {
           }`}
         >
           {/* Row 1: Sol, Operational Phase, Emergency Banner, MEDA Weather & Utility Buttons */}
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
-              <h1 className="text-sm sm:text-base font-bold tracking-tight text-white">
+          <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-1.5">
+            <div className="flex flex-wrap sm:flex-nowrap items-center gap-x-1 gap-y-0.5 min-w-0">
+              <h1 className="text-[11.5px] font-bold tracking-tight text-white whitespace-nowrap">
                 OUTPOST COMMAND
               </h1>
               <span
                 data-testid="hud-sol-counter"
-                className="text-xs sm:text-sm font-mono font-semibold text-cyan-300 whitespace-nowrap"
+                className="text-[10.5px] font-mono font-semibold text-cyan-300 whitespace-nowrap"
               >
-                <ScienceTermButton termKey="sol" onSelectTerm={setActiveTerm} /> {mission.sol} /{' '}
+                <ScienceTermButton termKey="sol" onSelectTerm={setActiveTerm} /> {mission.sol}/
                 {MAX_SOLS}
               </span>
               <span
                 data-testid="hud-phase-badge"
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-mono font-semibold whitespace-nowrap ${
+                className={`inline-flex items-center gap-1 px-1 py-0.5 rounded border text-[9.5px] font-mono font-semibold whitespace-nowrap ${
                   mission.opPhase === 'sol_complete'
                     ? 'bg-emerald-950/90 border-emerald-400/70 text-emerald-200'
                     : mission.opPhase === 'operation'
@@ -580,19 +964,19 @@ export default function App() {
               {isEmergency && (
                 <span
                   data-testid="emergency-protocol-badge"
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-950/90 border border-rose-500/80 text-[11px] font-mono font-bold text-rose-200 whitespace-nowrap"
+                  className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-rose-950/90 border border-rose-500/80 text-[9.5px] font-mono font-bold text-rose-200 whitespace-nowrap"
                 >
-                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+                  <AlertTriangle className="w-2.5 h-2.5 text-amber-400 shrink-0" aria-hidden="true" />
                   <span>
                     {donkiVisualState.level === 'x_class' || emergencyMode === 'flare'
-                      ? 'SOLAR FLARE ALERT'
-                      : 'DUST STORM ALERT'}
+                      ? 'FLARE'
+                      : 'DUST'}
                   </span>
                 </span>
               )}
-              <span className="hidden md:inline-flex items-center gap-2 text-xs font-mono text-slate-300">
+              <span className="hidden md:inline-flex items-center gap-1 text-[10px] font-mono text-slate-300 whitespace-nowrap">
                 <span data-testid="hud-sol-clock" className="text-cyan-300 font-semibold">
-                  {formatMmSs(mission.operationElapsedSec)} / {formatMmSs(SOL_DURATION_SEC)}
+                  {formatMmSs(mission.operationElapsedSec)}/{formatMmSs(SOL_DURATION_SEC)}
                 </span>
                 <span className="text-slate-600">·</span>
                 <span>{mission.weather.tempMinC}°C</span>
@@ -611,7 +995,7 @@ export default function App() {
                   setDonkiFeedOpen((prev) => !prev);
                 }}
                 title="Inspect Live NASA DONKI Event & 3D Space Weather"
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs font-mono font-bold cursor-pointer transition-colors whitespace-nowrap ${
+                className={`inline-flex items-center gap-0.5 px-1 py-0.5 rounded border text-[10px] font-mono font-bold cursor-pointer transition-colors whitespace-nowrap ${
                   donkiVisualState.level === 'x_class'
                     ? 'bg-rose-950/90 border-rose-400 text-rose-200 hover:bg-rose-900'
                     : donkiVisualState.level === 'm_class'
@@ -619,15 +1003,15 @@ export default function App() {
                     : 'bg-slate-800/90 border-slate-600 text-amber-300 hover:border-cyan-400'
                 }`}
               >
-                <Sun className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <Sun className="w-2.5 h-2.5 shrink-0" aria-hidden="true" />
                 <span>{donkiVisualState.flare.classType}</span>
                 {donkiVisualState.cme.impactActive && (
-                  <span className="text-[10px] text-rose-300">· CME</span>
+                  <span className="text-[9px] text-rose-300">·CME</span>
                 )}
               </button>
             </div>
 
-            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            <div className="flex items-center gap-1 shrink-0">
               <button
                 type="button"
                 data-testid="nasa-data-log-btn"
@@ -636,15 +1020,15 @@ export default function App() {
                   missionAudio.playClick();
                   setDonkiFeedOpen((prev) => !prev);
                 }}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border cursor-pointer whitespace-nowrap transition-colors ${
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10.5px] font-medium border cursor-pointer whitespace-nowrap transition-colors ${
                   donkiFeedOpen
                     ? 'bg-cyan-500/20 border-cyan-400 text-cyan-100'
                     : 'bg-slate-800 hover:bg-slate-700 text-cyan-300 border-slate-700'
                 }`}
               >
-                <Database className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>NASA Data Log</span>
-                <span className="font-mono text-[10px] text-emerald-300">
+                <Database className="w-3 h-3" aria-hidden="true" />
+                <span>Logs</span>
+                <span className="font-mono text-[9.5px] text-emerald-300">
                   ({unlockedLogIds.length}/9)
                 </span>
               </button>
@@ -652,9 +1036,9 @@ export default function App() {
                 type="button"
                 onClick={toggleMute}
                 aria-label={muted ? 'Unmute sound effects' : 'Mute sound effects'}
-                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer"
+                className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer"
               >
-                {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                {muted ? <VolumeX className="w-3 h-3" /> : <Volume2 className="w-3 h-3" />}
               </button>
               <button
                 type="button"
@@ -663,38 +1047,38 @@ export default function App() {
                   startMission();
                 }}
                 aria-label="Restart mission"
-                className="p-1.5 sm:px-2.5 sm:py-1.5 inline-flex items-center gap-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 border border-slate-700 cursor-pointer"
+                className="p-1 sm:px-1.5 sm:py-0.5 inline-flex items-center gap-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[10.5px] font-medium text-slate-200 border border-slate-700 cursor-pointer"
               >
-                <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+                <RotateCcw className="w-3 h-3" aria-hidden="true" />
                 <span className="hidden sm:inline">Reset</span>
               </button>
             </div>
           </div>
 
           {/* Row 2: The 3 Coupled Resource Bars */}
-          <div className="grid grid-cols-3 gap-2 sm:gap-4">
+          <div className="grid grid-cols-3 gap-2">
             {/* 1. Power Grid */}
             <div
-              className={`relative bg-[#0B1220] border rounded-xl px-2.5 py-1.5 ${
+              className={`relative bg-[#0B1220] border rounded-lg px-2 py-1 ${
                 isEmergency ? 'border-rose-800/80' : 'border-slate-800'
               }`}
             >
-              <div className="flex items-center justify-between gap-1 text-[11px] sm:text-xs">
+              <div className="flex items-center justify-between gap-1 text-[10.5px] sm:text-[11px]">
                 <span className="inline-flex items-center gap-1 font-medium text-amber-200 truncate">
-                  <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+                  <Zap className="w-3 h-3 text-amber-400 shrink-0" aria-hidden="true" />
                   <span className="hidden sm:inline">Power</span>
                 </span>
                 <span
                   data-testid="meter-power-value"
-                  className="font-mono font-bold text-white tabular-nums"
+                  className="font-mono font-bold text-white tabular-nums whitespace-nowrap"
                 >
                   {mission.opPhase === 'operation'
                     ? mission.exactResources.powerKwh.toFixed(1)
                     : mission.resources.powerKwh}{' '}
-                  <span className="text-[10px] text-slate-400">kWh</span>
+                  <span className="text-[9.5px] text-slate-400">kWh</span>
                 </span>
               </div>
-              <div className="mt-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+              <div className="mt-0.5 h-1 rounded-full bg-slate-800 overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-200 ${
                     powerPct < 25 ? 'bg-rose-500' : 'bg-amber-400'
@@ -703,7 +1087,7 @@ export default function App() {
                 />
               </div>
               {mission.opPhase === 'operation' && mission.operationRates && (
-                <p className="mt-0.5 text-[10px] font-mono text-slate-400 text-right tabular-nums">
+                <p className="mt-0.5 text-[9.5px] font-mono text-slate-400 text-right tabular-nums leading-none">
                   {formatRate(mission.operationRates.powerPerSec, 'kWh')}
                 </p>
               )}
@@ -711,7 +1095,7 @@ export default function App() {
                 <span
                   key={`p-${hudDeltas.id}`}
                   data-testid="hud-delta-power"
-                  className={`anim-float-pop absolute -bottom-4 right-2 text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
+                  className={`anim-float-pop absolute -bottom-4 right-2 text-[10.5px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
                     hudDeltas.power > 0
                       ? 'text-emerald-300 border-emerald-500/60'
                       : 'text-amber-300 border-amber-500/60'
@@ -724,25 +1108,25 @@ export default function App() {
 
             {/* 2. Life Support O2 & Water */}
             <div
-              className={`relative bg-[#0B1220] border rounded-xl px-2.5 py-1.5 ${
+              className={`relative bg-[#0B1220] border rounded-lg px-2 py-1 ${
                 isEmergency ? 'border-rose-800/80' : 'border-slate-800'
               }`}
             >
-              <div className="flex items-center justify-between gap-1 text-[11px] sm:text-xs">
+              <div className="flex items-center justify-between gap-1 text-[10.5px] sm:text-[11px]">
                 <span className="inline-flex items-center gap-1 font-medium text-cyan-200 truncate">
-                  <Wind className="w-3.5 h-3.5 text-cyan-400 shrink-0" aria-hidden="true" />
+                  <Wind className="w-3 h-3 text-cyan-400 shrink-0" aria-hidden="true" />
                   <span className="hidden sm:inline">O₂ & Water</span>
                 </span>
                 <span
                   data-testid="meter-life-value"
-                  className="font-mono font-bold text-white tabular-nums"
+                  className="font-mono font-bold text-white tabular-nums whitespace-nowrap"
                 >
                   {mission.opPhase === 'operation'
                     ? `${mission.exactResources.lifeSupportPct.toFixed(1)}%`
                     : `${lifePct}%`}
                 </span>
               </div>
-              <div className="mt-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+              <div className="mt-0.5 h-1 rounded-full bg-slate-800 overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-200 ${
                     lifePct < 30 ? 'bg-rose-500' : 'bg-cyan-400'
@@ -751,7 +1135,7 @@ export default function App() {
                 />
               </div>
               {mission.opPhase === 'operation' && mission.operationRates && (
-                <p className="mt-0.5 text-[10px] font-mono text-slate-400 text-right tabular-nums">
+                <p className="mt-0.5 text-[9.5px] font-mono text-slate-400 text-right tabular-nums leading-none">
                   {formatRate(mission.operationRates.lifePerSec, '%')}
                 </p>
               )}
@@ -759,7 +1143,7 @@ export default function App() {
                 <span
                   key={`l-${hudDeltas.id}`}
                   data-testid="hud-delta-life"
-                  className={`anim-float-pop absolute -bottom-4 right-2 text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
+                  className={`anim-float-pop absolute -bottom-4 right-2 text-[10.5px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
                     hudDeltas.life > 0
                       ? 'text-cyan-300 border-cyan-500/60'
                       : 'text-amber-300 border-amber-500/60'
@@ -772,28 +1156,31 @@ export default function App() {
 
             {/* 3. Radiation Shield & Crew Health */}
             <div
-              className={`relative bg-[#0B1220] border rounded-xl px-2.5 py-1.5 ${
+              className={`relative bg-[#0B1220] border rounded-lg px-2 py-1 ${
                 isEmergency ? 'border-rose-800/80' : 'border-slate-800'
               }`}
             >
-              <div className="flex items-center justify-between gap-1 text-[11px] sm:text-xs">
+              <div className="flex items-center justify-between gap-1 text-[10.5px] sm:text-[11px]">
                 <span className="inline-flex items-center gap-1 font-medium text-emerald-200 truncate">
-                  <Shield className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+                  <Shield className="w-3 h-3 text-emerald-400 shrink-0" aria-hidden="true" />
                   <span className="hidden sm:inline">Shield & Crew</span>
                 </span>
                 <span
                   data-testid="meter-health-value"
-                  className="font-mono font-bold text-white tabular-nums"
+                  className="font-mono font-bold text-white tabular-nums whitespace-nowrap"
                 >
                   {mission.opPhase === 'operation'
                     ? `${mission.exactResources.crewHealthPct.toFixed(1)}%`
                     : `${healthPct}%`}{' '}
-                  <span className="hidden md:inline text-[10px] text-sky-300">
-                    ({mission.resources.waterWallCm}cm)
+                  <span
+                    data-testid="meter-health-csv"
+                    className="hidden md:inline text-[9.5px] text-sky-300"
+                  >
+                    ({mission.resources.waterWallCm}cm·{mission.radiationDoseCsv.toFixed(2)}cSv)
                   </span>
                 </span>
               </div>
-              <div className="mt-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+              <div className="mt-0.5 h-1 rounded-full bg-slate-800 overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-200 ${
                     healthPct < 35 ? 'bg-rose-500' : 'bg-emerald-400'
@@ -802,7 +1189,7 @@ export default function App() {
                 />
               </div>
               {mission.opPhase === 'operation' && mission.operationRates && (
-                <p className="mt-0.5 text-[10px] font-mono text-slate-400 text-right tabular-nums">
+                <p className="mt-0.5 text-[9.5px] font-mono text-slate-400 text-right tabular-nums leading-none">
                   {formatRate(mission.operationRates.healthPerSec, '%')}
                 </p>
               )}
@@ -810,7 +1197,7 @@ export default function App() {
                 <span
                   key={`h-${hudDeltas.id}`}
                   data-testid="hud-delta-health"
-                  className={`anim-float-pop absolute -bottom-4 right-2 text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
+                  className={`anim-float-pop absolute -bottom-4 right-2 text-[10.5px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#070B14] border ${
                     hudDeltas.health > 0
                       ? 'text-emerald-300 border-emerald-500/60'
                       : 'text-rose-300 border-rose-500/60'
@@ -840,20 +1227,56 @@ export default function App() {
         onClose={() => setDonkiFeedOpen(false)}
       />
 
-      {/* Bottom Dock: Optional Earth Audio Dispatch Drawer + Operational Phase Console */}
-      <footer className="fixed bottom-2.5 sm:bottom-4 inset-x-2.5 sm:inset-x-5 z-20 pointer-events-none">
-        <EarthDispatchDrawer
-          open={dispatchOpen && !isNightCycle}
-          currentSol={mission.sol}
-          emergencyMode={emergencyMode}
-          decryptedSols={decryptedSols}
-          onMarkDecrypted={handleMarkDecrypted}
-          onClose={() => setDispatchOpen(false)}
+      {/* Collapsible Floating Rover Cam (FHAZ) HUD Widget (Exterior View) */}
+      <RoverCamWidget
+        currentSol={mission.sol}
+        roverPhase={roverPhase}
+        targetLabel={roverTargetLabel}
+        photo={roverPhoto}
+        photoHistory={roverPhotoHistory}
+        loading={roverPhotoLoading}
+        collapsed={roverCamCollapsed}
+        hiddenByInspector={(donkiFeedOpen && !modalOpen) || modalOpen || viewMode === 'interior'}
+        canDeploy={!isNightCycle && !modalOpen && isPhase2Or3}
+        powerKwh={mission.resources.powerKwh}
+        onToggleCollapse={() => setRoverCamCollapsed((prev) => !prev)}
+        onSelectPhoto={(selected) => setRoverPhoto(selected)}
+        onQuickDeploy={handleDeployRover}
+      />
+
+      {/* First-Person Habitat Interior HUD (Top telemetry bar remains visible above) */}
+      {viewMode === 'interior' && !modalOpen && (
+        <InteriorHudOverlay
+          interiorState={interiorState}
+          statusBanner={interiorStatusBanner}
+          moxieCrisisActive={
+            emergencyMode !== 'none' ||
+            chapter.hazardType !== 'none' ||
+            mission.resources.lifeSupportPct < 65 ||
+            donkiVisualState.level !== 'quiet'
+          }
+          isSol10Highlight={mission.sol >= MAX_SOLS}
+          onExitInterior={exitInteriorMode}
+          onTriggerInteract={handleInteriorInteract}
+          onVirtualInputChange={(input) => viewportRef.current?.setVirtualInteriorInput(input)}
         />
+      )}
+
+      {/* Bottom Dock: Optional Earth Audio Dispatch Drawer + Operational Phase Console (Exterior View) */}
+      {viewMode === 'exterior' && (
+        <footer className="fixed bottom-2 sm:bottom-2.5 inset-x-2.5 sm:inset-x-5 z-20 pointer-events-none">
+          <EarthDispatchDrawer
+            open={dispatchOpen && !isNightCycle}
+            currentSol={mission.sol}
+            emergencyMode={emergencyMode}
+            decryptedSols={decryptedSols}
+            onMarkDecrypted={handleMarkDecrypted}
+            onClose={() => setDispatchOpen(false)}
+          />
 
         <div
           data-testid="story-banner"
-          className={`pointer-events-auto max-w-5xl mx-auto rounded-2xl p-3 sm:p-4 shadow-2xl flex flex-col gap-3 border transition-colors ${emBorderClass} ${
+          className={`pointer-events-auto max-w-3xl mx-auto rounded-xl p-2 sm:p-2.5 shadow-2xl flex flex-col gap-1.5 border transition-colors ${emBorderClass} ${
             isEmergency
               ? 'bg-[#19090E]/94 border-rose-500/80'
               : donkiVisualState.level === 'm_class'
@@ -865,31 +1288,31 @@ export default function App() {
           {isPhase2Or3 && (
             <div
               data-testid="operation-timer-panel"
-              className="rounded-xl bg-[#0B1220] border border-slate-800 px-3 py-2 flex flex-col gap-1.5"
+              className="rounded-lg bg-[#0B1220] border border-slate-800 px-2.5 py-1 flex flex-col gap-1"
             >
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                <div className="flex items-center gap-2 min-w-0">
+              <div className="flex items-center justify-between gap-2 text-[11px] min-w-0">
+                <div className="flex items-center gap-1.5 min-w-0">
                   <Clock
-                    className={`w-3.5 h-3.5 shrink-0 ${
+                    className={`w-3 h-3 shrink-0 ${
                       mission.opPhase === 'sol_complete' ? 'text-emerald-400' : 'text-cyan-400'
                     }`}
                     aria-hidden="true"
                   />
-                  <span className="font-mono font-semibold text-white">
+                  <span className="font-mono font-semibold text-white truncate">
                     {mission.opPhase === 'sol_complete'
-                      ? '5-Minute Sol Complete — Ready to Advance'
+                      ? 'Sol Complete — Ready'
                       : mission.fastForwardActive
-                      ? `${FAST_FORWARD_MULTIPLIER}× Fast Forward — Atmosphere & Systems Advancing`
-                      : '5-Minute Sol Operation — Monitor Base'}
+                      ? `${FAST_FORWARD_MULTIPLIER}× Fast Forward`
+                      : 'Sol Operation'}
                   </span>
                   {mission.lockedChoice && (
-                    <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] font-mono text-amber-200 truncate">
-                      Directive: {mission.lockedChoice.label}
+                    <span className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono text-amber-200 truncate">
+                      {mission.lockedChoice.label}
                     </span>
                   )}
                 </div>
 
-                <div className="flex items-center gap-3 font-mono text-xs tabular-nums shrink-0">
+                <div className="flex items-center gap-2 font-mono text-[11px] tabular-nums shrink-0 whitespace-nowrap">
                   <span
                     data-testid="operation-speed-badge"
                     className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
@@ -915,7 +1338,7 @@ export default function App() {
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={opProgressPct}
-                className="h-2 rounded-full bg-slate-800 overflow-hidden"
+                className="h-1.5 rounded-full bg-slate-800 overflow-hidden"
               >
                 <div
                   data-testid="operation-progress-fill"
@@ -933,12 +1356,12 @@ export default function App() {
           )}
 
           {/* Main Command Row: Briefing / Crisis Alert + Phase Action Controls */}
-          <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
-            <div className="flex items-start gap-3 min-w-0 flex-1">
+          <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-2">
+            <div className="flex items-start gap-2 min-w-0 flex-1">
               <CharacterPortrait speaker={chapter.speaker} />
-              <div className="min-w-0 flex-1 space-y-1">
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
-                  <strong className="text-sm text-white">{chapter.speakerName}</strong>
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+                  <strong className="text-xs text-white">{chapter.speakerName}</strong>
                   <span
                     className={
                       isEmergency ? 'text-rose-300 font-mono' : 'text-amber-300 font-mono'
@@ -946,13 +1369,13 @@ export default function App() {
                   >
                     {chapter.arcTitle}
                   </span>
-                  <span className="text-slate-400 hidden sm:inline">· {chapter.commNote}</span>
+                  <span className="text-slate-400 hidden lg:inline">· {chapter.commNote}</span>
                 </div>
 
                 {isPhase1 && mission.pendingDilemma ? (
                   <div
                     data-testid="crisis-alert-box"
-                    className="rounded-lg bg-amber-950/35 border border-amber-500/40 px-2.5 py-1.5 text-xs text-slate-200 leading-snug"
+                    className="rounded-lg bg-amber-950/35 border border-amber-500/40 px-2 py-1 text-[11px] text-slate-200 leading-snug"
                   >
                     <span className="font-mono font-bold text-amber-300 uppercase mr-1.5">
                       Crisis Alert:
@@ -961,14 +1384,14 @@ export default function App() {
                     <span>{mission.pendingDilemma.description}</span>
                   </div>
                 ) : (
-                  <p className="text-xs sm:text-sm text-slate-200 leading-snug">
+                  <p className="text-[11px] text-slate-200 leading-snug line-clamp-2">
                     {isNightCycle
                       ? `Simulating Sol ${mission.sol} sunset & overnight transition across Jezero Crater...`
                       : chapter.storyPrompt}
                   </p>
                 )}
 
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400 pt-0.5">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-slate-400 pt-0.5">
                   <button
                     type="button"
                     data-testid="toggle-dispatch-btn"
@@ -977,7 +1400,7 @@ export default function App() {
                       missionAudio.playClick();
                       setDispatchOpen((prev) => !prev);
                     }}
-                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[11px] cursor-pointer transition-colors ${
+                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] cursor-pointer transition-colors whitespace-nowrap ${
                       dispatchOpen
                         ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200'
                         : hasUnreadDispatch
@@ -985,18 +1408,17 @@ export default function App() {
                         : 'bg-[#0B1220] border-slate-700 text-cyan-300 hover:border-cyan-400'
                     }`}
                   >
-                    <Radio className="w-3 h-3 shrink-0" aria-hidden="true" />
-                    <span>{dispatchOpen ? 'Hide DSN Dispatch' : 'Houston DSN Dispatch'}</span>
+                    <Radio className="w-2.5 h-2.5 shrink-0" aria-hidden="true" />
+                    <span>{dispatchOpen ? 'Hide DSN' : 'DSN Dispatch'}</span>
                     {hasUnreadDispatch && !dispatchOpen && (
                       <span className="text-amber-300 font-bold">· NEW</span>
                     )}
                   </button>
-                  <span className="hidden sm:inline">Decoder:</span>
                   <ScienceTermButton termKey="moxie" onSelectTerm={setActiveTerm} />
                   <ScienceTermButton termKey="waterwall" onSelectTerm={setActiveTerm} />
                   <ScienceTermButton termKey="hydroponics" onSelectTerm={setActiveTerm} />
                   <ScienceTermButton termKey="commdelay" onSelectTerm={setActiveTerm} />
-                  <span className="font-mono text-cyan-300 ml-auto">
+                  <span className="font-mono text-cyan-300 ml-auto whitespace-nowrap">
                     {mission.resources.sciencePoints} Sci Pts
                   </span>
                 </div>
@@ -1004,16 +1426,16 @@ export default function App() {
             </div>
 
             {/* Phase-Specific Right Action Area */}
-            <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 shrink-0">
+            <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5 shrink-0">
               {isPhase1 && (
                 <button
                   type="button"
                   data-testid="open-decision-cards-btn"
                   disabled={isNightCycle || isDecisionModalOpen}
                   onClick={handleOpenDecisionCards}
-                  className="w-full md:w-auto inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs sm:text-sm transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-300"
+                  className="w-full md:w-auto inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-300"
                 >
-                  <Sparkles className="w-4 h-4 shrink-0" aria-hidden="true" />
+                  <Sparkles className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                   <span>Open Decision Cards</span>
                 </button>
               )}
@@ -1030,7 +1452,7 @@ export default function App() {
                       modalOpen
                     }
                     onClick={handleToggleFastForward}
-                    className={`inline-flex items-center justify-center gap-1.5 px-3.5 py-3 rounded-xl font-semibold text-xs sm:text-sm border transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-cyan-300 ${
+                    className={`inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg font-semibold text-xs border transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-cyan-300 ${
                       mission.fastForwardUnlocked && mission.opPhase === 'operation' && !isNightCycle
                         ? mission.fastForwardActive
                           ? 'bg-cyan-500/20 hover:bg-cyan-500/30 border-cyan-400 text-cyan-100 cursor-pointer'
@@ -1039,7 +1461,7 @@ export default function App() {
                     }`}
                   >
                     {mission.fastForwardUnlocked ? (
-                      <FastForward className="w-4 h-4 shrink-0 text-cyan-300" aria-hidden="true" />
+                      <FastForward className="w-3.5 h-3.5 shrink-0 text-cyan-300" aria-hidden="true" />
                     ) : (
                       <Lock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                     )}
@@ -1060,9 +1482,9 @@ export default function App() {
                       data-testid="end-sol-btn"
                       disabled={isNightCycle || modalOpen}
                       onClick={handleAdvanceNextSol}
-                      className="inline-flex items-center justify-center gap-2 px-4 sm:px-5 py-3 rounded-xl font-semibold text-xs sm:text-sm transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-cyan-300 bg-emerald-400 hover:bg-emerald-300 text-slate-950"
+                      className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg font-semibold text-xs transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-cyan-300 bg-emerald-400 hover:bg-emerald-300 text-slate-950"
                     >
-                      <Moon className="w-4 h-4 shrink-0" aria-hidden="true" />
+                      <Moon className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                       <span>End Sol / Next Operation</span>
                     </button>
                   )}
@@ -1071,9 +1493,28 @@ export default function App() {
             </div>
           </div>
         </div>
-      </footer>
+        </footer>
+      )}
 
       {/* Modals */}
+      {roverTerminalOpen && (
+        <RoverTerminalModal
+          currentSol={mission.sol}
+          powerKwh={mission.resources.powerKwh}
+          roverPhase={roverPhase}
+          targetLabel={roverTargetLabel}
+          photo={roverPhoto}
+          photoHistory={roverPhotoHistory}
+          loading={roverPhotoLoading}
+          canDeploy={!isNightCycle && !mission.debrief}
+          analyzedRockIds={analyzedRockIds}
+          onClose={() => setRoverTerminalOpen(false)}
+          onDeployRover={handleDeployRover}
+          onSelectPhoto={(selected) => setRoverPhoto(selected)}
+          onRefreshFeed={handleRefreshRoverFeed}
+        />
+      )}
+
       {isDecisionModalOpen && mission.pendingDilemma && !mission.debrief && (
         <DilemmaModal
           dilemma={mission.pendingDilemma}

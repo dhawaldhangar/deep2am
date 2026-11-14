@@ -21,6 +21,12 @@ export const SOL_DURATION_SEC = 300; // 5 minutes per Sol
 export const OPERATION_DURATION_SEC = SOL_DURATION_SEC;
 export const FAST_FORWARD_UNLOCK_SEC = 120; // Fast Forward strictly locked for first 2 minutes
 export const FAST_FORWARD_MULTIPLIER = 5; // 5x simulation speed once unlocked
+export const ROVER_POWER_COST_KWH = 10;
+export const ROVER_TRAVEL_TIME_SEC = 4; // 2s outbound + 2s return
+export const ROVER_WORK_DURATION_SEC = 3; // 3s laser/maintenance pause
+export const ROVER_ROCK_SCIENCE_PTS = 5;
+
+export type RoverTaskTarget = 'solar' | 'moxie' | 'rock';
 
 export type AtmosphereAlertMode = 'none' | 'dust' | 'flare';
 export type SolOperationalPhase =
@@ -216,6 +222,7 @@ export interface MissionState {
   activeFlare: NasaFlareRecord;
   pendingDilemma: DilemmaEvent | null;
   usedDilemmaIds: string[];
+  radiationDoseCsv: number;
   logs: MissionLogEntry[];
   debrief: DebriefReport | null;
 }
@@ -277,6 +284,7 @@ export function createInitialMissionState(
     activeFlare,
     pendingDilemma: initialDilemma,
     usedDilemmaIds: [],
+    radiationDoseCsv: 0.01,
     logs: [
       {
         sol: 1,
@@ -822,11 +830,14 @@ function applyOperationStep(
     (allowUnlock ? nextElapsed >= FAST_FORWARD_UNLOCK_SEC : nextElapsed >= FAST_FORWARD_UNLOCK_SEC);
   const completedSol = nextElapsed >= state.operationDurationSec;
 
+  const csvDelta = (rates.radDoseMsv * 0.1 * simDtSec) / state.operationDurationSec;
+
   return {
     ...state,
     opPhase: completedSol ? 'sol_complete' : 'operation',
     operationElapsedSec: nextElapsed,
     fastForwardUnlocked: unlocked,
+    radiationDoseCsv: Number((state.radiationDoseCsv + csvDelta).toFixed(4)),
     resources: updatedResources,
     exactResources: nextExact,
   };
@@ -862,22 +873,44 @@ export function toggleFastForward(state: MissionState): MissionState {
  */
 export function applyModuleActionToMission(
   state: MissionState,
-  moduleId: ModuleId
+  moduleId: ModuleId,
+  options?: { flareActive?: boolean }
 ): { nextState: MissionState; result: ModuleActionResult } {
   const result = performModuleAction(state.resources, moduleId);
   if (!result.applied) {
     return { nextState: state, result };
   }
 
+  const isManualExternal = moduleId === 'solar' || moduleId === 'moxie';
+  const flarePenaltyActive = Boolean(options?.flareActive) && isManualExternal;
+  const radHealthPenalty = flarePenaltyActive ? -5 : 0;
+  const radCsvDelta = flarePenaltyActive ? 0.05 : 0;
+
+  const adjustedResult: ModuleActionResult = flarePenaltyActive
+    ? {
+        ...result,
+        deltaHealth: result.deltaHealth + radHealthPenalty,
+        feedbackText: `${result.feedbackText} · ${radHealthPenalty}% Rad EVA`,
+      }
+    : result;
+
   const nextExact: ExactResources = {
-    powerKwh: clamp(state.exactResources.powerKwh + result.deltaPower, 0, MAX_BATTERY_KWH),
-    lifeSupportPct: clamp(state.exactResources.lifeSupportPct + result.deltaLife, 0, 100),
-    crewHealthPct: clamp(state.exactResources.crewHealthPct + result.deltaHealth, 0, 100),
-    panelDustPct: clamp(state.exactResources.panelDustPct + result.deltaDust, 0, 85),
+    powerKwh: clamp(state.exactResources.powerKwh + adjustedResult.deltaPower, 0, MAX_BATTERY_KWH),
+    lifeSupportPct: clamp(
+      state.exactResources.lifeSupportPct + adjustedResult.deltaLife,
+      0,
+      100
+    ),
+    crewHealthPct: clamp(
+      state.exactResources.crewHealthPct + adjustedResult.deltaHealth,
+      0,
+      100
+    ),
+    panelDustPct: clamp(state.exactResources.panelDustPct + adjustedResult.deltaDust, 0, 85),
   };
 
   const syncedResources: MissionResources = {
-    ...result.nextResources,
+    ...adjustedResult.nextResources,
     powerKwh: Math.round(nextExact.powerKwh),
     lifeSupportPct: Math.round(nextExact.lifeSupportPct),
     crewHealthPct: Math.round(nextExact.crewHealthPct),
@@ -901,9 +934,290 @@ export function applyModuleActionToMission(
       ...state,
       resources: syncedResources,
       exactResources: nextExact,
+      radiationDoseCsv: Number((state.radiationDoseCsv + radCsvDelta).toFixed(3)),
       operationRates: nextRates,
     },
-    result,
+    result: adjustedResult,
+  };
+}
+
+export interface RoverDispatchResult {
+  dispatched: boolean;
+  reason?: string;
+  nextState: MissionState;
+  deltaPower: number;
+}
+
+/**
+ * Deducts 10 kWh from Power reserves when deploying the autonomous Mars Utility Rover.
+ */
+export function deployRoverFromMission(state: MissionState): RoverDispatchResult {
+  if (state.exactResources.powerKwh < ROVER_POWER_COST_KWH) {
+    return {
+      dispatched: false,
+      reason: `Need at least ${ROVER_POWER_COST_KWH} kWh Power to deploy Rover!`,
+      nextState: state,
+      deltaPower: 0,
+    };
+  }
+
+  const nextExactPower = clamp(
+    state.exactResources.powerKwh - ROVER_POWER_COST_KWH,
+    0,
+    MAX_BATTERY_KWH
+  );
+  const deltaPower = Math.round(nextExactPower - state.exactResources.powerKwh);
+
+  const nextExact: ExactResources = {
+    ...state.exactResources,
+    powerKwh: nextExactPower,
+  };
+
+  const syncedResources: MissionResources = {
+    ...state.resources,
+    powerKwh: Math.round(nextExactPower),
+  };
+
+  const chapter = getSolChapter(state.sol);
+  const nextRates =
+    state.opPhase === 'operation' || state.opPhase === 'sol_complete'
+      ? computeOperationRates(
+          syncedResources,
+          state.weather,
+          state.activeFlare,
+          chapter,
+          state.lockedChoice
+        )
+      : state.operationRates;
+
+  return {
+    dispatched: true,
+    nextState: {
+      ...state,
+      resources: syncedResources,
+      exactResources: nextExact,
+      operationRates: nextRates,
+    },
+    deltaPower,
+  };
+}
+
+export interface RoverCompletionOutcome {
+  nextState: MissionState;
+  deltaPower: number;
+  deltaLife: number;
+  deltaHealth: number; // Strictly 0 (zero radiation penalty)
+  deltaDust: number;
+  deltaScience: number;
+  feedbackText: string;
+}
+
+/**
+ * Completes an external maintenance task or rock scan via the autonomous Rover
+ * with ZERO radiation penalty to the crew (0 cSv added, 0% crew health lost).
+ */
+export function completeRoverTaskOnMission(
+  state: MissionState,
+  target: RoverTaskTarget,
+  targetLabel = 'Martian Sample'
+): RoverCompletionOutcome {
+  let deltaLife = 0;
+  let deltaDust = 0;
+  let deltaScience = 0;
+  let headline = '';
+  let detail = '';
+  let feedbackText = '';
+
+  if (target === 'solar') {
+    const nextDust = clamp(state.exactResources.panelDustPct - 25, 0, 85);
+    deltaDust = Math.round(nextDust - state.exactResources.panelDustPct);
+    deltaScience = 2;
+    headline = `Rover Cleaned Solar Arrays (${deltaDust}% Dust)`;
+    detail = 'Autonomous rover swept static red dust off panels with 0.00 cSv crew radiation penalty.';
+    feedbackText = `Rover Clean ${deltaDust}% Dust · +2 Sci · 0 Rad`;
+  } else if (target === 'moxie') {
+    const nextLife = clamp(state.exactResources.lifeSupportPct + 14, 0, 100);
+    deltaLife = Math.round(nextLife - state.exactResources.lifeSupportPct);
+    deltaScience = 2;
+    headline = 'Rover Serviced MOXIE Intake Filter';
+    detail = `Rover laser-cleared CO₂ filter (+${deltaLife}% O₂) with 0.00 cSv crew radiation penalty.`;
+    feedbackText = `Rover +${deltaLife}% O₂ · +2 Sci · 0 Rad`;
+  } else {
+    deltaScience = ROVER_ROCK_SCIENCE_PTS;
+    headline = `Rover Analyzed ${targetLabel}`;
+    detail = `ChemCam laser spectroscopy on ${targetLabel} awarded +${ROVER_ROCK_SCIENCE_PTS} Sci Pts with 0.00 cSv crew exposure.`;
+    feedbackText = `+${ROVER_ROCK_SCIENCE_PTS} Sci Pts · ${targetLabel}`;
+  }
+
+  const nextExact: ExactResources = {
+    ...state.exactResources,
+    lifeSupportPct: clamp(state.exactResources.lifeSupportPct + deltaLife, 0, 100),
+    panelDustPct: clamp(state.exactResources.panelDustPct + deltaDust, 0, 85),
+  };
+
+  const syncedResources: MissionResources = {
+    ...state.resources,
+    powerKwh: Math.round(nextExact.powerKwh),
+    lifeSupportPct: Math.round(nextExact.lifeSupportPct),
+    crewHealthPct: Math.round(nextExact.crewHealthPct),
+    panelDustPct: Math.round(nextExact.panelDustPct),
+    sciencePoints: state.resources.sciencePoints + deltaScience,
+  };
+
+  const chapter = getSolChapter(state.sol);
+  const nextRates =
+    state.opPhase === 'operation' || state.opPhase === 'sol_complete'
+      ? computeOperationRates(
+          syncedResources,
+          state.weather,
+          state.activeFlare,
+          chapter,
+          state.lockedChoice
+        )
+      : state.operationRates;
+
+  return {
+    nextState: {
+      ...state,
+      resources: syncedResources,
+      exactResources: nextExact,
+      operationRates: nextRates,
+      logs: [
+        {
+          sol: state.sol,
+          headline,
+          detail,
+          nasaSource: 'Mars Utility Rover · FHAZ Autonav',
+          tone: 'nominal',
+        },
+        ...state.logs,
+      ],
+    },
+    deltaPower: 0,
+    deltaLife,
+    deltaHealth: 0,
+    deltaDust,
+    deltaScience,
+    feedbackText,
+  };
+}
+
+export interface InteriorActionOutcome {
+  nextState: MissionState;
+  deltaLife: number;
+  deltaScience: number;
+  deltaCropGrowth: number;
+  feedbackText: string;
+}
+
+/**
+ * Zone B Manual MOXIE Intake Valve Repair: +15% O₂ & Water with 0 radiation penalty.
+ */
+export function performInteriorMoxieRepair(state: MissionState): InteriorActionOutcome {
+  const nextLifeExact = clamp(state.exactResources.lifeSupportPct + 15, 0, 100);
+  const deltaLife = Math.round(nextLifeExact - state.exactResources.lifeSupportPct);
+
+  const nextExact: ExactResources = {
+    ...state.exactResources,
+    lifeSupportPct: nextLifeExact,
+  };
+
+  const syncedResources: MissionResources = {
+    ...state.resources,
+    lifeSupportPct: Math.round(nextLifeExact),
+  };
+
+  const chapter = getSolChapter(state.sol);
+  const nextRates =
+    state.opPhase === 'operation' || state.opPhase === 'sol_complete'
+      ? computeOperationRates(
+          syncedResources,
+          state.weather,
+          state.activeFlare,
+          chapter,
+          state.lockedChoice
+        )
+      : state.operationRates;
+
+  return {
+    nextState: {
+      ...state,
+      resources: syncedResources,
+      exactResources: nextExact,
+      operationRates: nextRates,
+      logs: [
+        {
+          sol: state.sol,
+          headline: 'Manual MOXIE Intake Valve Repaired',
+          detail: `Zone B interior maintenance cleared CO₂ intake occlusion (+${deltaLife}% O₂ & Water).`,
+          nasaSource: 'Habitat Bay B · MOXIE Telemetry',
+          tone: 'nominal',
+        },
+        ...state.logs,
+      ],
+    },
+    deltaLife,
+    deltaScience: 0,
+    deltaCropGrowth: 0,
+    feedbackText: deltaLife > 0 ? `+${deltaLife}% O₂ & Water (MOXIE Valve Fixed)` : 'MOXIE Intake Optimal (100% O₂)',
+  };
+}
+
+/**
+ * Zone C Hydroponics Bio-Dome "Water Crops & Harvest O2": +10% O₂ & Water and +5 Sci Pts.
+ */
+export function performInteriorBiodomeHarvest(state: MissionState): InteriorActionOutcome {
+  const nextLifeExact = clamp(state.exactResources.lifeSupportPct + 10, 0, 100);
+  const deltaLife = Math.round(nextLifeExact - state.exactResources.lifeSupportPct);
+  const nextCropGrowth = Math.min(6, state.resources.cropGrowth + 1);
+  const deltaCropGrowth = nextCropGrowth - state.resources.cropGrowth;
+  const deltaScience = 5;
+
+  const nextExact: ExactResources = {
+    ...state.exactResources,
+    lifeSupportPct: nextLifeExact,
+  };
+
+  const syncedResources: MissionResources = {
+    ...state.resources,
+    lifeSupportPct: Math.round(nextLifeExact),
+    cropGrowth: nextCropGrowth,
+    sciencePoints: state.resources.sciencePoints + deltaScience,
+  };
+
+  const chapter = getSolChapter(state.sol);
+  const nextRates =
+    state.opPhase === 'operation' || state.opPhase === 'sol_complete'
+      ? computeOperationRates(
+          syncedResources,
+          state.weather,
+          state.activeFlare,
+          chapter,
+          state.lockedChoice
+        )
+      : state.operationRates;
+
+  return {
+    nextState: {
+      ...state,
+      resources: syncedResources,
+      exactResources: nextExact,
+      operationRates: nextRates,
+      logs: [
+        {
+          sol: state.sol,
+          headline: 'Bio-Dome Crops Watered & O₂ Harvested',
+          detail: `Zone C UV hydroponic racks boosted oxygen (+${deltaLife}% O₂ & Water) and yielded +5 Sci Pts.`,
+          nasaSource: 'Habitat Bay C · Hydroponics Lab',
+          tone: 'nominal',
+        },
+        ...state.logs,
+      ],
+    },
+    deltaLife,
+    deltaScience,
+    deltaCropGrowth,
+    feedbackText: `+${deltaLife}% O₂ & Water · +5 Sci Pts`,
   };
 }
 

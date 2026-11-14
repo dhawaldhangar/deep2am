@@ -7,7 +7,7 @@ interface CharacterPortraitProps {
 export const CharacterPortrait: React.FC<CharacterPortraitProps> = ({ speaker }) => {
   const isMaya = speaker === 'maya';
   return (
-    <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-xl bg-[#070B14] border border-slate-700 overflow-hidden shrink-0 flex items-center justify-center">
+    <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-lg bg-[#070B14] border border-slate-700 overflow-hidden shrink-0 flex items-center justify-center">
       <svg
         viewBox="0 0 80 80"
         role="img"

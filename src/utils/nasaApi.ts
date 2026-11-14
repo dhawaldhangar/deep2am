@@ -206,3 +206,232 @@ export async function fetchNasaDonkiTelemetry(): Promise<DonkiFetchResult> {
     };
   }
 }
+
+export interface RoverCameraPhoto {
+  id: number;
+  sol: number;
+  imgSrc: string;
+  earthDate: string;
+  cameraName: string;
+  cameraFullName: string;
+  sourceMode: 'SOL_FHAZ' | 'LATEST_FALLBACK' | 'SYNTHETIC_FALLBACK' | 'LOCAL_ARCHIVE';
+}
+
+interface NebulumPhotoRecord {
+  id?: number;
+  sol?: number;
+  img_src?: string;
+  earth_date?: string;
+  camera?: {
+    name?: string;
+    full_name?: string;
+  };
+}
+
+export function buildPerseveranceFhazUrl(sol: number): string {
+  const safeSol = Math.max(1, Math.floor(sol));
+  return `https://rovers.nebulum.one/api/v1/rovers/perseverance/photos?sol=${safeSol}&camera=FRONT_HAZCAM_LEFT_A`;
+}
+
+export function buildPerseveranceLatestUrl(): string {
+  return 'https://rovers.nebulum.one/api/v1/rovers/perseverance/latest_photos';
+}
+
+export function parsePerseverancePhotosList(
+  payload: unknown,
+  sourceMode: 'SOL_FHAZ' | 'LATEST_FALLBACK',
+  fallbackSol: number,
+  limit = 6
+): RoverCameraPhoto[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const record = payload as {
+    photos?: NebulumPhotoRecord[];
+    latest_photos?: NebulumPhotoRecord[];
+  };
+  const list = Array.isArray(record.photos)
+    ? record.photos
+    : Array.isArray(record.latest_photos)
+    ? record.latest_photos
+    : [];
+  if (list.length === 0) return [];
+
+  const fhazOnly = list.filter(
+    (p) => p.camera?.name === 'FRONT_HAZCAM_LEFT_A' && typeof p.img_src === 'string' && p.img_src.length > 0
+  );
+  const pool =
+    fhazOnly.length > 0
+      ? fhazOnly
+      : list.filter((p) => typeof p.img_src === 'string' && p.img_src.length > 0);
+
+  const seenUrls = new Set<string>();
+  const results: RoverCameraPhoto[] = [];
+
+  for (const item of pool) {
+    const url = item.img_src;
+    if (!url || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    results.push({
+      id: typeof item.id === 'number' ? item.id : Date.now() + results.length,
+      sol: typeof item.sol === 'number' ? item.sol : fallbackSol,
+      imgSrc: url,
+      earthDate: item.earth_date || '2021-02-20',
+      cameraName: item.camera?.name || 'FRONT_HAZCAM_LEFT_A',
+      cameraFullName: item.camera?.full_name || 'Front Hazard Avoidance Camera - Left',
+      sourceMode,
+    });
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
+
+export function parsePerseverancePhotoResponse(
+  payload: unknown,
+  sourceMode: 'SOL_FHAZ' | 'LATEST_FALLBACK',
+  fallbackSol: number
+): RoverCameraPhoto | null {
+  const list = parsePerseverancePhotosList(payload, sourceMode, fallbackSol, 1);
+  return list[0] ?? null;
+}
+
+export function createSyntheticFhazDataUrl(sol: number, targetLabel: string): string {
+  if (typeof document === 'undefined') return '';
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = 200;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+
+  const grad = ctx.createLinearGradient(0, 0, 0, 200);
+  grad.addColorStop(0, '#5a5a5e');
+  grad.addColorStop(0.36, '#8b8b90');
+  grad.addColorStop(0.38, '#3f3f44');
+  grad.addColorStop(1, '#26262a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 320, 200);
+
+  // Horizon crater rim & regolith rocks
+  ctx.fillStyle = '#48484c';
+  ctx.beginPath();
+  ctx.moveTo(0, 76);
+  ctx.lineTo(58, 66);
+  ctx.lineTo(132, 72);
+  ctx.lineTo(215, 62);
+  ctx.lineTo(320, 74);
+  ctx.lineTo(320, 92);
+  ctx.lineTo(0, 92);
+  ctx.closePath();
+  ctx.fill();
+
+  for (let i = 0; i < 36; i++) {
+    const rx = ((i * 89 + sol * 31) % 300) + 10;
+    const ry = 88 + ((i * 47 + sol * 13) % 102);
+    const rw = 4 + (i % 5) * 4;
+    const rh = 3 + (i % 4) * 2.5;
+    ctx.fillStyle = i % 2 === 0 ? '#6e6e74' : '#303034';
+    ctx.fillRect(rx, ry, rw, rh);
+  }
+
+  // Subtle target boulder silhouette in center
+  ctx.fillStyle = '#7c7c82';
+  ctx.beginPath();
+  ctx.moveTo(132, 138);
+  ctx.lineTo(148, 114);
+  ctx.lineTo(176, 118);
+  ctx.lineTo(188, 138);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(226, 232, 240, 0.72)';
+  ctx.font = '10px monospace';
+  ctx.fillText(`NASA JPL FHAZ ARCHIVE · SOL ${sol}`, 10, 18);
+  ctx.fillText(`TARGET: ${targetLabel.toUpperCase()}`, 10, 188);
+
+  return canvas.toDataURL('image/png');
+}
+
+export interface RoverCameraBatchResult {
+  primary: RoverCameraPhoto;
+  gallery: RoverCameraPhoto[];
+}
+
+/**
+ * Fetches real Mars Perseverance Hazard Avoidance Camera (FHAZ) photos for the current Sol,
+ * falling back to Perseverance latest_photos if the Sol returns an empty photos array.
+ */
+export async function fetchPerseveranceFhazBatch(
+  currentSol: number,
+  targetLabel = 'Jezero Surface',
+  seenPhotoIds: number[] = []
+): Promise<RoverCameraBatchResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+
+  const pickNextPhoto = (photos: RoverCameraPhoto[]): RoverCameraPhoto => {
+    const unseen = photos.find((p) => !seenPhotoIds.includes(p.id));
+    if (unseen) return unseen;
+    return photos[seenPhotoIds.length % photos.length];
+  };
+
+  try {
+    const solRes = await fetch(buildPerseveranceFhazUrl(currentSol), {
+      signal: controller.signal,
+    });
+    if (solRes.ok) {
+      const solJson = await solRes.json();
+      const parsedList = parsePerseverancePhotosList(solJson, 'SOL_FHAZ', currentSol, 8);
+      if (parsedList.length > 0) {
+        clearTimeout(timeout);
+        return {
+          primary: pickNextPhoto(parsedList),
+          gallery: parsedList,
+        };
+      }
+    }
+
+    const latestRes = await fetch(buildPerseveranceLatestUrl(), {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (latestRes.ok) {
+      const latestJson = await latestRes.json();
+      const parsedLatestList = parsePerseverancePhotosList(
+        latestJson,
+        'LATEST_FALLBACK',
+        currentSol,
+        8
+      );
+      if (parsedLatestList.length > 0) {
+        return {
+          primary: pickNextPhoto(parsedLatestList),
+          gallery: parsedLatestList,
+        };
+      }
+    }
+  } catch {
+    clearTimeout(timeout);
+  }
+
+  const fallback: RoverCameraPhoto = {
+    id: Date.now(),
+    sol: currentSol,
+    imgSrc: createSyntheticFhazDataUrl(currentSol, targetLabel),
+    earthDate: '2021-02-20',
+    cameraName: 'FRONT_HAZCAM_LEFT_A',
+    cameraFullName: 'Front Hazard Avoidance Camera - Left (Offline Fallback)',
+    sourceMode: 'SYNTHETIC_FALLBACK',
+  };
+  return {
+    primary: fallback,
+    gallery: [fallback],
+  };
+}
+
+export async function fetchPerseveranceFhazPhoto(
+  currentSol: number,
+  targetLabel = 'Jezero Surface'
+): Promise<RoverCameraPhoto> {
+  const batch = await fetchPerseveranceFhazBatch(currentSol, targetLabel);
+  return batch.primary;
+}
+

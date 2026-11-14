@@ -7,9 +7,11 @@ import {
   applyModuleActionToMission,
   calculateNightCycle,
   checkDefeatReason,
+  completeRoverTaskOnMission,
   computeSolAtmosphereTargets,
   computeTauFogDensity,
   createInitialMissionState,
+  deployRoverFromMission,
   FAST_FORWARD_MULTIPLIER,
   FAST_FORWARD_UNLOCK_SEC,
   getSolChapter,
@@ -20,17 +22,23 @@ import {
   performModuleAction,
   resolveDilemmaChoice,
   resolveNightCycleStep,
+  ROVER_POWER_COST_KWH,
+  ROVER_ROCK_SCIENCE_PTS,
   SOL_DURATION_SEC,
   toggleFastForward,
 } from './simulation';
 import { VERIFIED_FALLBACK_FLARES } from '../data/nasaTelemetry';
 import { computeUnlockedLogIds, NASA_ARCHIVE_ENTRIES } from '../data/campaignArc';
 import {
+  buildPerseveranceFhazUrl,
+  buildPerseveranceLatestUrl,
   classifyDonkiSeverity,
   computeDonkiVisualState,
   DEFAULT_ARCHIVE_CME,
   HISTORICAL_X9_CME,
   HISTORICAL_X9_FLARE,
+  parsePerseverancePhotoResponse,
+  parsePerseverancePhotosList,
 } from '../utils/nasaApi';
 
 test('initial mission state starts at Sol 1 in Phase 1 crisis_brief with 2 tactical choices and 300s Sol duration', () => {
@@ -367,5 +375,223 @@ test('DONKI severity classification distinguishes quiet/C-class, M-class, and X-
   assert.equal(simXState.flare.classType, 'X9.3');
   assert.equal(simXState.intensity, 1.0);
 });
+
+test('deployRoverFromMission deducts 10 kWh and guards against insufficient battery', () => {
+  const initial = createInitialMissionState(VERIFIED_FALLBACK_FLARES);
+  const res = deployRoverFromMission(initial);
+  assert.equal(res.dispatched, true);
+  assert.equal(res.deltaPower, -ROVER_POWER_COST_KWH);
+  assert.equal(res.nextState.resources.powerKwh, initial.resources.powerKwh - 10);
+
+  const lowPower = {
+    ...initial,
+    resources: { ...initial.resources, powerKwh: 6 },
+    exactResources: { ...initial.exactResources, powerKwh: 6 },
+  };
+  const blocked = deployRoverFromMission(lowPower);
+  assert.equal(blocked.dispatched, false);
+  assert.equal(blocked.deltaPower, 0);
+});
+
+test('rover completes external tasks with zero radiation penalty and awards +5 Sci Pts on rocks', () => {
+  let state = createInitialMissionState(VERIFIED_FALLBACK_FLARES);
+  state = openDecisionCards(state);
+  state = lockInDecisionChoice(state, state.pendingDilemma!.choices[0]);
+
+  const startHealth = state.exactResources.crewHealthPct;
+  const startCsv = state.radiationDoseCsv;
+
+  // Manual external EVA during active M4.2 flare incurs -5% health and +0.05 cSv
+  const manualSolar = applyModuleActionToMission(state, 'solar', { flareActive: true });
+  assert.equal(manualSolar.result.deltaHealth, -5);
+  assert.equal(manualSolar.nextState.exactResources.crewHealthPct, startHealth - 5);
+  assert.equal(manualSolar.nextState.radiationDoseCsv, Number((startCsv + 0.05).toFixed(3)));
+
+  // Rover deployment + solar cleaning completes with ZERO radiation penalty
+  const dispatch = deployRoverFromMission(state);
+  assert.equal(dispatch.dispatched, true);
+  const roverSolar = completeRoverTaskOnMission(dispatch.nextState, 'solar', 'Solar Array Field');
+  assert.equal(roverSolar.deltaHealth, 0);
+  assert.equal(roverSolar.nextState.exactResources.crewHealthPct, startHealth);
+  assert.equal(roverSolar.nextState.radiationDoseCsv, startCsv);
+  assert.ok(roverSolar.deltaDust < 0);
+
+  // Rover rock spectroscopy awards +5 Sci Pts with 0 radiation
+  const startSci = roverSolar.nextState.resources.sciencePoints;
+  const roverRock = completeRoverTaskOnMission(
+    roverSolar.nextState,
+    'rock',
+    'Delta Mudstone'
+  );
+  assert.equal(roverRock.deltaScience, ROVER_ROCK_SCIENCE_PTS);
+  assert.equal(roverRock.nextState.resources.sciencePoints, startSci + 5);
+  assert.equal(roverRock.deltaHealth, 0);
+  assert.equal(roverRock.nextState.radiationDoseCsv, startCsv);
+});
+
+test('Perseverance FHAZ API URL builders and fallback response parser handle Sol and latest_photos', () => {
+  assert.equal(
+    buildPerseveranceFhazUrl(4),
+    'https://rovers.nebulum.one/api/v1/rovers/perseverance/photos?sol=4&camera=FRONT_HAZCAM_LEFT_A'
+  );
+  assert.equal(
+    buildPerseveranceLatestUrl(),
+    'https://rovers.nebulum.one/api/v1/rovers/perseverance/latest_photos'
+  );
+
+  // Empty Sol photos array returns null so caller falls back to latest_photos
+  assert.equal(parsePerseverancePhotoResponse({ photos: [] }, 'SOL_FHAZ', 4), null);
+
+  // Latest photos fallback parses cleanly
+  const parsed = parsePerseverancePhotoResponse(
+    {
+      latest_photos: [
+        {
+          id: 9912,
+          sol: 1204,
+          img_src: 'https://mars.nasa.gov/mars2020-raw-images/test-fhaz.jpg',
+          earth_date: '2024-07-09',
+          camera: {
+            name: 'FRONT_HAZCAM_LEFT_A',
+            full_name: 'Front Hazard Avoidance Camera - Left',
+          },
+        },
+      ],
+    },
+    'LATEST_FALLBACK',
+    4
+  );
+
+  assert.ok(parsed);
+  assert.equal(parsed.cameraName, 'FRONT_HAZCAM_LEFT_A');
+  assert.equal(parsed.earthDate, '2024-07-09');
+  assert.equal(parsed.imgSrc, 'https://mars.nasa.gov/mars2020-raw-images/test-fhaz.jpg');
+  assert.equal(parsed.sourceMode, 'LATEST_FALLBACK');
+});
+
+test('parsePerseverancePhotosList extracts multiple unique FHAZ images for the gallery strip', () => {
+  const photos = parsePerseverancePhotosList(
+    {
+      photos: [
+        {
+          id: 188,
+          sol: 1,
+          img_src: 'https://mars.nasa.gov/fhaz-1.jpg',
+          earth_date: '2021-02-19',
+          camera: { name: 'FRONT_HAZCAM_LEFT_A', full_name: 'Front Hazard Avoidance Camera - Left' },
+        },
+        {
+          id: 189,
+          sol: 1,
+          img_src: 'https://mars.nasa.gov/fhaz-1.jpg',
+          earth_date: '2021-02-19',
+          camera: { name: 'FRONT_HAZCAM_LEFT_A', full_name: 'Front Hazard Avoidance Camera - Left' },
+        },
+        {
+          id: 194,
+          sol: 1,
+          img_src: 'https://mars.nasa.gov/fhaz-2.jpg',
+          earth_date: '2021-02-19',
+          camera: { name: 'FRONT_HAZCAM_LEFT_A', full_name: 'Front Hazard Avoidance Camera - Left' },
+        },
+        {
+          id: 195,
+          sol: 1,
+          img_src: 'https://mars.nasa.gov/fhaz-3.jpg',
+          earth_date: '2021-02-19',
+          camera: { name: 'FRONT_HAZCAM_LEFT_A', full_name: 'Front Hazard Avoidance Camera - Left' },
+        },
+      ],
+    },
+    'SOL_FHAZ',
+    1,
+    4
+  );
+
+  assert.equal(photos.length, 3);
+  assert.deepEqual(
+    photos.map((p) => p.id),
+    [188, 194, 195]
+  );
+});
+
+import {
+  clampInteriorPlayerPosition,
+  findNearestInteractable,
+  getInteriorZoneAt,
+  INTERIOR_SPAWN,
+} from './interiorCollision';
+import {
+  performInteriorBiodomeHarvest,
+  performInteriorMoxieRepair,
+} from './simulation';
+
+test('interior collision keeps player inside 3 connected zones and blocks furniture overlap', () => {
+  // Spawn starts in Zone A (Central Command Dome)
+  const spawnZone = getInteriorZoneAt(INTERIOR_SPAWN.x, INTERIOR_SPAWN.z);
+  assert.equal(spawnZone.id, 'command_dome');
+
+  // Cannot walk out past Zone A outer shell wall
+  const outerWall = clampInteriorPlayerPosition(0, 6.0, 0, 14.0);
+  assert.ok(Math.hypot(outerWall.x, outerWall.z) < 8.1);
+
+  // Can traverse West Bulkhead Corridor cleanly from Zone A into Zone B (MOXIE Bay)
+  const westAirlock = clampInteriorPlayerPosition(-7.0, 0, -11.0, 0);
+  assert.equal(getInteriorZoneAt(westAirlock.x, westAirlock.z).id, 'west_airlock');
+  const moxieBay = clampInteriorPlayerPosition(-14.0, 0, -18.5, 0);
+  assert.equal(getInteriorZoneAt(moxieBay.x, moxieBay.z).id, 'moxie_bay');
+
+  // Can traverse East Bulkhead Corridor cleanly from Zone A into Zone C (Hydroponics Bio-Dome)
+  const eastAirlock = clampInteriorPlayerPosition(7.0, 0, 11.0, 0);
+  assert.equal(getInteriorZoneAt(eastAirlock.x, eastAirlock.z).id, 'east_airlock');
+  const bioDome = clampInteriorPlayerPosition(14.0, 0, 18.5, 0);
+  assert.equal(getInteriorZoneAt(bioDome.x, bioDome.z).id, 'biodome');
+
+  // Pushes player out of the central Holographic Mars Map table at (0, 0)
+  const pushed = clampInteriorPlayerPosition(0, 2.6, 0, 0.5);
+  assert.ok(Math.hypot(pushed.x, pushed.z) >= 1.86);
+});
+
+test('interior contextual interactable prompts activate within 3 units when facing stations', () => {
+  // Standing near Rover Terminal in Zone A facing -Z
+  const roverPrompt = findNearestInteractable(0, -3.5, 0, -1);
+  assert.ok(roverPrompt);
+  assert.equal(roverPrompt.interactable.id, 'rover_terminal');
+
+  // Standing near MOXIE generator in Zone B facing West/North-West
+  const moxiePrompt = findNearestInteractable(-19.5, -1.0, -1, -0.2);
+  assert.ok(moxiePrompt);
+  assert.equal(moxiePrompt.interactable.id, 'moxie_unit');
+
+  // Standing near Hydroponics Plant Racks in Zone C facing North
+  const bioPrompt = findNearestInteractable(20.0, -0.4, 0, -1);
+  assert.ok(bioPrompt);
+  assert.equal(bioPrompt.interactable.id, 'crop_racks');
+
+  // Far from all stations in corridor returns null
+  const corridorNone = findNearestInteractable(-11.5, 0, -1, 0);
+  assert.equal(corridorNone, null);
+});
+
+test('interior manual MOXIE repair (+15% O2) and Bio-Dome harvest (+10% O2, +5 Sci Pts) update simulation cleanly', () => {
+  let state = createInitialMissionState(VERIFIED_FALLBACK_FLARES);
+  state = {
+    ...state,
+    resources: { ...state.resources, lifeSupportPct: 60, sciencePoints: 10 },
+    exactResources: { ...state.exactResources, lifeSupportPct: 60 },
+  };
+
+  const moxieFixed = performInteriorMoxieRepair(state);
+  assert.equal(moxieFixed.deltaLife, 15);
+  assert.equal(moxieFixed.nextState.resources.lifeSupportPct, 75);
+
+  const harvested = performInteriorBiodomeHarvest(moxieFixed.nextState);
+  assert.equal(harvested.deltaLife, 10);
+  assert.equal(harvested.deltaScience, 5);
+  assert.equal(harvested.nextState.resources.lifeSupportPct, 85);
+  assert.equal(harvested.nextState.resources.sciencePoints, 15);
+});
+
+
 
 

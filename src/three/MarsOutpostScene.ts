@@ -1,12 +1,24 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { ModuleId, SolHazardType } from '../data/campaignArc';
+import {
+  clampInteriorPlayerPosition,
+  findNearestInteractable,
+  getInteriorZoneAt,
+  INTERIOR_EYE_HEIGHT,
+  INTERIOR_SPAWN,
+  InteriorInteractable,
+  InteriorInteractableId,
+  InteriorZoneInfo,
+} from '../game/interiorCollision';
 import {
   computeTauFogDensity,
   MissionResources,
   SolAtmosphereTargets,
 } from '../game/simulation';
+import { HabitatInteriorWorld } from './HabitatInteriorWorld';
 import {
   createContactShadowTexture,
   createDustOverlayTexture,
@@ -38,6 +50,9 @@ export interface AtmosphereTimelineInput {
   donki?: DonkiSceneTelemetry;
 }
 
+export type RoverPhase = 'idle' | 'outbound' | 'working' | 'returning';
+export type ScienceBoulderId = 'rock-delta' | 'rock-olivine' | 'rock-carbonate' | 'rock-sulfate';
+
 export interface ProjectedModuleAnchor {
   id: ModuleId;
   x: number;
@@ -45,10 +60,38 @@ export interface ProjectedModuleAnchor {
   visible: boolean;
 }
 
+export interface ProjectedRockAnchor {
+  id: ScienceBoulderId;
+  label: string;
+  x: number;
+  y: number;
+  visible: boolean;
+}
+
+export type RoverMissionTarget =
+  | { kind: 'solar' | 'moxie'; moduleId: 'solar' | 'moxie'; label: string }
+  | { kind: 'rock'; rockId: ScienceBoulderId; label: string };
+
+export type SceneViewMode = 'exterior' | 'interior';
+
+export interface InteriorPlayerState {
+  zone: InteriorZoneInfo;
+  nearestInteractable: InteriorInteractable | null;
+  pointerLocked: boolean;
+}
+
 export interface MarsSceneCallbacks {
   onModuleClick: (moduleId: ModuleId) => void;
   onHoverModule: (moduleId: ModuleId | null) => void;
   onAnchorsUpdate: (anchors: ProjectedModuleAnchor[]) => void;
+  onRockClick?: (rockId: ScienceBoulderId, label: string) => void;
+  onHoverRock?: (rockId: ScienceBoulderId | null) => void;
+  onRockAnchorsUpdate?: (anchors: ProjectedRockAnchor[]) => void;
+  onRoverPhaseChange?: (phase: RoverPhase, label: string | null) => void;
+  onRoverTaskComplete?: (target: RoverMissionTarget) => void;
+  onViewModeChange?: (mode: SceneViewMode) => void;
+  onInteriorStateUpdate?: (state: InteriorPlayerState) => void;
+  onInteriorInteract?: (id: InteriorInteractableId) => void;
   onWebglError?: (reason: string) => void;
 }
 
@@ -250,6 +293,43 @@ export class MarsOutpostScene {
   private pointerNdc = new THREE.Vector2();
   private projScratch = new THREE.Vector3();
   private lastAnchors: ProjectedModuleAnchor[] = [];
+  private lastRockAnchors: ProjectedRockAnchor[] = [];
+
+  // Clickable Martian science boulders
+  private rockWorldCenters: Partial<Record<ScienceBoulderId, THREE.Vector3>> = {};
+  private rockAnchorWorldMap: Partial<Record<ScienceBoulderId, THREE.Vector3>> = {};
+  private rockRings: Partial<Record<ScienceBoulderId, THREE.Mesh>> = {};
+  private hoveredRock: ScienceBoulderId | null = null;
+
+  // Autonomous Mars Utility Rover & Laser Maintenance Effects
+  private roverGroup!: THREE.Group;
+  private roverMastGroup!: THREE.Group;
+  private roverLaserEyeMesh!: THREE.Mesh;
+  private roverLaserEyeMat!: THREE.MeshStandardMaterial;
+  private roverWheels: THREE.Mesh[] = [];
+  private roverLaserGroup!: THREE.Group;
+  private roverLaserCore!: THREE.Mesh;
+  private roverLaserGlow!: THREE.Mesh;
+  private roverImpactSpot!: THREE.Mesh;
+  private roverImpactLight!: THREE.PointLight;
+  private roverSparksPoints!: THREE.Points;
+  private roverSparkPositions!: Float32Array;
+  private roverSparkVelocities: Array<{ vx: number; vy: number; vz: number; life: number }> = [];
+  private readonly roverHomePos = new THREE.Vector3(3.6, 0, 4.4);
+  private readonly roverHomeYaw = -0.62;
+  private roverPhase: RoverPhase = 'idle';
+  private roverPhaseElapsed = 0;
+  private roverPhaseStartMs = 0;
+  private roverMissionTarget: RoverMissionTarget | null = null;
+  private roverMissionNotified = false;
+  private roverStartPos = new THREE.Vector3();
+  private roverStopPos = new THREE.Vector3();
+  private roverAimPos = new THREE.Vector3();
+  private roverEyeWorldScratch = new THREE.Vector3();
+  private roverAimOscScratch = new THREE.Vector3();
+  private roverBeamDirScratch = new THREE.Vector3();
+  private roverMidScratch = new THREE.Vector3();
+  private roverUpScratch = new THREE.Vector3(0, 1, 0);
 
   private pointerDownPos = { x: 0, y: 0 };
   private hoveredModule: ModuleId | null = null;
@@ -337,6 +417,29 @@ export class MarsOutpostScene {
   private destroyed = false;
   private lastFrameTime = performance.now();
   private totalTime = 0;
+
+  // First-Person Habitat Interior Mode state
+  private viewMode: SceneViewMode = 'exterior';
+  private interiorWorld!: HabitatInteriorWorld;
+  private interiorCamera!: THREE.PerspectiveCamera;
+  private pointerLockControls!: PointerLockControls;
+  private interiorPlayer = {
+    x: INTERIOR_SPAWN.x,
+    z: INTERIOR_SPAWN.z,
+    yaw: INTERIOR_SPAWN.yaw,
+    pitch: 0,
+    walkDistance: 0,
+    bobOffset: 0,
+  };
+  private pressedKeys = new Set<string>();
+  private virtualInteriorInput = { forward: 0, right: 0, turn: 0 };
+  private isDraggingInteriorLook = false;
+  private lastDragLookPos = { x: 0, y: 0 };
+  private interiorInputPaused = false;
+  private lastInteriorZoneId: string | null = null;
+  private lastInteriorPromptId: InteriorInteractableId | null = null;
+  private lastInteriorLocked = false;
+  private lastInteriorMoveTime = performance.now();
 
   constructor(container: HTMLElement, callbacks: MarsSceneCallbacks) {
     this.container = container;
@@ -426,12 +529,41 @@ export class MarsOutpostScene {
     this.buildMarsTerrain();
     this.buildCraterRimMountains();
     this.buildMarsRocks();
+    this.buildScienceBoulders();
     this.buildOutpostModules();
     this.buildStorytellingProps();
     this.buildHazardsAndRings();
+    this.initInteriorWorld(width, height);
     this.syncVisualState();
     this.renderer.render(this.scene, this.camera);
     this.emitProjectedAnchors();
+  }
+
+  private initInteriorWorld(width: number, height: number): void {
+    this.interiorWorld = new HabitatInteriorWorld(
+      this.envRenderTarget?.texture ?? null,
+      this.isSoftwareGl
+    );
+    this.interiorCamera = new THREE.PerspectiveCamera(62, width / height, 0.1, 180);
+    this.interiorCamera.rotation.order = 'YXZ';
+    this.interiorCamera.position.set(
+      this.interiorPlayer.x,
+      INTERIOR_EYE_HEIGHT,
+      this.interiorPlayer.z
+    );
+    this.interiorCamera.rotation.set(this.interiorPlayer.pitch, this.interiorPlayer.yaw, 0, 'YXZ');
+
+    this.pointerLockControls = new PointerLockControls(
+      this.interiorCamera,
+      this.renderer.domElement
+    );
+    this.pointerLockControls.addEventListener('lock', () => {
+      this.emitInteriorState(true);
+    });
+    this.pointerLockControls.addEventListener('unlock', () => {
+      this.syncYawPitchFromCamera();
+      this.emitInteriorState(true);
+    });
   }
 
   private buildLights(): void {
@@ -790,7 +922,20 @@ float marsFbm(vec2 p) {
       const dBio = Math.hypot(x - 6.8, z - 2.0);
       const dMoxie = Math.hypot(x + 3.7, z + 4.4);
       const dRover = Math.hypot(x - 3.6, z - 4.4);
-      return dSolar > 4.6 && dBio > 3.8 && dMoxie > 3.5 && dRover > 2.2;
+      const dRock1 = Math.hypot(x + 9.4, z - 5.8);
+      const dRock2 = Math.hypot(x + 1.4, z - 5.8);
+      const dRock3 = Math.hypot(x - 5.8, z - 5.6);
+      const dRock4 = Math.hypot(x - 9.2, z - 4.4);
+      return (
+        dSolar > 4.6 &&
+        dBio > 3.8 &&
+        dMoxie > 3.5 &&
+        dRover > 2.2 &&
+        dRock1 > 2.0 &&
+        dRock2 > 2.0 &&
+        dRock3 > 2.0 &&
+        dRock4 > 2.0
+      );
     };
 
     // 1. Half-Buried Angular Boulders (~44)
@@ -914,6 +1059,134 @@ float marsFbm(vec2 p) {
     if (pebbles.instanceColor) pebbles.instanceColor.needsUpdate = true;
     pebbles.computeBoundingSphere();
     this.scene.add(pebbles);
+  }
+
+  private buildScienceBoulders(): void {
+    const boulderConfigs: Array<{
+      id: ScienceBoulderId;
+      label: string;
+      x: number;
+      z: number;
+      scale: number;
+      color: string;
+      seed: number;
+    }> = [
+      {
+        id: 'rock-delta',
+        label: 'Delta Mudstone',
+        x: -9.4,
+        z: 5.8,
+        scale: 1.02,
+        color: '#8C432B',
+        seed: 31,
+      },
+      {
+        id: 'rock-olivine',
+        label: 'Olivine Basalt',
+        x: -1.4,
+        z: 5.8,
+        scale: 1.04,
+        color: '#5A3229',
+        seed: 47,
+      },
+      {
+        id: 'rock-carbonate',
+        label: 'Carbonate Outcrop',
+        x: 5.8,
+        z: 5.6,
+        scale: 0.98,
+        color: '#9D4F34',
+        seed: 61,
+      },
+      {
+        id: 'rock-sulfate',
+        label: 'Sulfate Vein',
+        x: 9.2,
+        z: 4.4,
+        scale: 0.96,
+        color: '#88432E',
+        seed: 83,
+      },
+    ];
+
+    const ringGeo = this.track(new THREE.RingGeometry(0.95, 1.12, 24));
+    ringGeo.rotateX(-Math.PI / 2);
+
+    boulderConfigs.forEach((cfg) => {
+      const y = groundHeightAt(cfg.x, cfg.z);
+      const group = new THREE.Group();
+      group.position.set(cfg.x, y, cfg.z);
+
+      const mainGeo = this.track(createAngularRockGeometry(cfg.seed, 0.72, 1));
+      const rockMat = this.track(
+        new THREE.MeshStandardMaterial({
+          color: cfg.color,
+          roughness: 0.86,
+          metalness: 0.08,
+        })
+      );
+      const mainRock = new THREE.Mesh(mainGeo, rockMat);
+      mainRock.position.y = 0.28 * cfg.scale;
+      mainRock.scale.set(cfg.scale * 1.15, cfg.scale * 0.85, cfg.scale);
+      mainRock.rotation.set(0.18, cfg.seed * 0.4, -0.14);
+      mainRock.castShadow = !this.isSoftwareGl;
+      mainRock.receiveShadow = !this.isSoftwareGl;
+      group.add(mainRock);
+
+      const shardGeo = this.track(createAngularRockGeometry(cfg.seed + 7, 0.34, 0));
+      const shard = new THREE.Mesh(shardGeo, rockMat);
+      shard.position.set(0.55 * cfg.scale, 0.14 * cfg.scale, 0.42 * cfg.scale);
+      shard.scale.set(0.9, 0.7, 0.9);
+      shard.castShadow = !this.isSoftwareGl;
+      group.add(shard);
+
+      // Subtle mineral glint crystal vein to make science boulders visually distinct
+      const crystalMat = this.track(
+        new THREE.MeshStandardMaterial({
+          color: '#38BDF8',
+          emissive: '#06B6D4',
+          emissiveIntensity: 0.45,
+          roughness: 0.25,
+          metalness: 0.4,
+        })
+      );
+      const vein = new THREE.Mesh(
+        this.track(new THREE.OctahedronGeometry(0.16 * cfg.scale, 0)),
+        crystalMat
+      );
+      vein.position.set(-0.22 * cfg.scale, 0.56 * cfg.scale, 0.28 * cfg.scale);
+      group.add(vein);
+
+      const ringMat = this.track(
+        new THREE.MeshBasicMaterial({
+          color: '#22D3EE',
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.32,
+          depthWrite: false,
+        })
+      );
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.position.y = 0.06;
+      group.add(ring);
+      this.rockRings[cfg.id] = ring;
+
+      this.scene.add(group);
+
+      // Invisible layer-1 hit collider for raycasting
+      const hitGeo = this.track(new THREE.CylinderGeometry(1.15, 1.25, 1.5, 12));
+      const hitMat = this.track(new THREE.MeshBasicMaterial({ visible: false }));
+      const hit = new THREE.Mesh(hitGeo, hitMat);
+      hit.position.set(cfg.x, y + 0.7, cfg.z);
+      hit.layers.set(1);
+      hit.userData.rockId = cfg.id;
+      hit.userData.rockLabel = cfg.label;
+      this.hitColliders.push(hit);
+      this.scene.add(hit);
+
+      this.rockWorldCenters[cfg.id] = new THREE.Vector3(cfg.x, y, cfg.z);
+      this.rockAnchorWorldMap[cfg.id] = new THREE.Vector3(cfg.x, y + 1.28 * cfg.scale, cfg.z);
+    });
   }
 
   private addHitCollider(moduleId: ModuleId, pos: THREE.Vector3, radius: number, height: number): void {
@@ -1882,92 +2155,243 @@ float marsFbm(vec2 p) {
     this.scene.add(rackGroup);
 
     // ------------------------------------------------------------------
-    // 5. PARKED MINI-ROVER (Front-Right: 3.6, y, 4.4)
+    // 5. AUTONOMOUS 6-WHEEL MARS UTILITY ROVER (Parked next to Habitat Dome)
     // ------------------------------------------------------------------
-    const roverPos = new THREE.Vector3(3.6, groundHeightAt(3.6, 4.4), 4.4);
-    const roverGroup = new THREE.Group();
-    roverGroup.position.copy(roverPos);
-    roverGroup.rotation.y = -0.62;
-    this.addGroundDecal(roverPos.x, roverPos.z, 1.45, shadowTex, 0.65, 0.025);
+    this.roverHomePos.set(3.6, groundHeightAt(3.6, 4.4), 4.4);
+    this.roverGroup = new THREE.Group();
+    this.roverGroup.position.copy(this.roverHomePos);
+    this.roverGroup.rotation.y = this.roverHomeYaw;
 
+    // Moving radial contact shadow beneath rover
+    const roverShadowGeo = this.track(new THREE.PlaneGeometry(2.6, 2.2));
+    roverShadowGeo.rotateX(-Math.PI / 2);
+    const roverShadowMat = this.track(
+      new THREE.MeshBasicMaterial({
+        map: shadowTex,
+        transparent: true,
+        opacity: 0.58,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      })
+    );
+    const roverShadow = new THREE.Mesh(roverShadowGeo, roverShadowMat);
+    roverShadow.position.y = 0.03;
+    this.roverGroup.add(roverShadow);
+
+    // White & gold Kapton thermal box chassis
     const roverBody = new THREE.Mesh(
-      this.track(new THREE.BoxGeometry(1.15, 0.42, 0.76)),
+      this.track(new THREE.BoxGeometry(1.22, 0.42, 0.78)),
       whiteAvionicsMat
     );
-    roverBody.position.y = 0.46;
+    roverBody.position.y = 0.48;
     roverBody.castShadow = !this.isSoftwareGl;
-    roverGroup.add(roverBody);
+    this.roverGroup.add(roverBody);
 
     const foilPanel = new THREE.Mesh(
-      this.track(new THREE.BoxGeometry(0.72, 0.44, 0.79)),
+      this.track(new THREE.BoxGeometry(0.76, 0.44, 0.81)),
       goldFoilMat
     );
-    foilPanel.position.set(-0.08, 0.46, 0);
-    roverGroup.add(foilPanel);
+    foilPanel.position.set(-0.08, 0.48, 0);
+    this.roverGroup.add(foilPanel);
 
-    // 6 treaded rover wheels with rocker-bogie side struts
+    const topDeck = new THREE.Mesh(
+      this.track(new THREE.BoxGeometry(1.12, 0.06, 0.7)),
+      darkTitaniumMat
+    );
+    topDeck.position.set(0, 0.71, 0);
+    this.roverGroup.add(topDeck);
+
+    // 6 black cylinder wheels with metallic hubcaps
     const wheelGeo = this.track(new THREE.CylinderGeometry(0.19, 0.19, 0.14, 14));
     wheelGeo.rotateX(Math.PI / 2);
+    const hubGeo = this.track(new THREE.CylinderGeometry(0.085, 0.085, 0.155, 10));
+    hubGeo.rotateX(Math.PI / 2);
     const wheelMat = this.track(
-      new THREE.MeshStandardMaterial({ color: '#27272A', roughness: 0.75, metalness: 0.35 })
+      new THREE.MeshStandardMaterial({ color: '#18181B', roughness: 0.78, metalness: 0.25 })
     );
-    for (const xW of [-0.46, 0.0, 0.46]) {
-      for (const zW of [-0.46, 0.46]) {
+    this.roverWheels = [];
+    for (const xW of [-0.48, 0.0, 0.48]) {
+      for (const zW of [-0.47, 0.47]) {
         const wheel = new THREE.Mesh(wheelGeo, wheelMat);
         wheel.position.set(xW, 0.19, zW);
         wheel.castShadow = !this.isSoftwareGl;
-        roverGroup.add(wheel);
+        const hub = new THREE.Mesh(hubGeo, goldFoilMat);
+        wheel.add(hub);
+        this.roverGroup.add(wheel);
+        this.roverWheels.push(wheel);
       }
     }
 
-    const strutGeo = this.track(new THREE.BoxGeometry(0.95, 0.06, 0.06));
-    for (const zS of [-0.4, 0.4]) {
-      const strut = new THREE.Mesh(strutGeo, darkTitaniumMat);
-      strut.position.set(0, 0.31, zS);
-      roverGroup.add(strut);
+    // Rocker-bogie suspension struts on left and right
+    const mainStrutGeo = this.track(new THREE.BoxGeometry(0.98, 0.055, 0.055));
+    const diagStrutGeo = this.track(new THREE.BoxGeometry(0.46, 0.048, 0.048));
+    for (const zS of [-0.41, 0.41]) {
+      const mainStrut = new THREE.Mesh(mainStrutGeo, darkTitaniumMat);
+      mainStrut.position.set(0, 0.28, zS);
+      this.roverGroup.add(mainStrut);
+
+      const frontArm = new THREE.Mesh(diagStrutGeo, steelMat);
+      frontArm.position.set(0.24, 0.37, zS);
+      frontArm.rotation.z = -0.58;
+      this.roverGroup.add(frontArm);
+
+      const rearArm = new THREE.Mesh(diagStrutGeo, steelMat);
+      rearArm.position.set(-0.24, 0.37, zS);
+      rearArm.rotation.z = 0.58;
+      this.roverGroup.add(rearArm);
     }
 
-    // Mast & optical ChemCam head
+    // Articulated mast & optical ChemCam head with red laser eye
+    this.roverMastGroup = new THREE.Group();
+    this.roverMastGroup.position.set(0.38, 0.72, 0.14);
+
     const mastPole = new THREE.Mesh(
-      this.track(new THREE.CylinderGeometry(0.04, 0.05, 0.68, 8)),
+      this.track(new THREE.CylinderGeometry(0.04, 0.052, 0.62, 8)),
       whiteAvionicsMat
     );
-    mastPole.position.set(0.38, 0.96, 0.16);
+    mastPole.position.set(0, 0.31, 0);
     mastPole.castShadow = !this.isSoftwareGl;
-    roverGroup.add(mastPole);
+    this.roverMastGroup.add(mastPole);
 
     const camHead = new THREE.Mesh(
-      this.track(new THREE.BoxGeometry(0.22, 0.14, 0.28)),
+      this.track(new THREE.BoxGeometry(0.24, 0.15, 0.3)),
       whiteAvionicsMat
     );
-    camHead.position.set(0.42, 1.32, 0.16);
+    camHead.position.set(0.04, 0.65, 0);
     camHead.castShadow = !this.isSoftwareGl;
-    roverGroup.add(camHead);
+    this.roverMastGroup.add(camHead);
 
-    const lensMat = this.track(
+    this.roverLaserEyeMat = this.track(
       new THREE.MeshStandardMaterial({
-        color: '#38BDF8',
-        emissive: '#0284C7',
-        emissiveIntensity: 0.9,
+        color: '#EF4444',
+        emissive: '#FF2424',
+        emissiveIntensity: 1.8,
         roughness: 0.15,
       })
     );
-    const lens = new THREE.Mesh(this.track(new THREE.CylinderGeometry(0.045, 0.045, 0.05, 10)), lensMat);
-    lens.rotation.z = Math.PI / 2;
-    lens.position.set(0.54, 1.32, 0.16);
-    roverGroup.add(lens);
+    this.roverLaserEyeMesh = new THREE.Mesh(
+      this.track(new THREE.CylinderGeometry(0.048, 0.048, 0.055, 10)),
+      this.roverLaserEyeMat
+    );
+    this.roverLaserEyeMesh.rotation.z = Math.PI / 2;
+    this.roverLaserEyeMesh.position.set(0.17, 0.65, 0);
+    this.roverMastGroup.add(this.roverLaserEyeMesh);
+
+    const fhazLensMat = this.track(
+      new THREE.MeshStandardMaterial({
+        color: '#38BDF8',
+        emissive: '#0284C7',
+        emissiveIntensity: 0.85,
+        roughness: 0.18,
+      })
+    );
+    const fhazCam = new THREE.Mesh(
+      this.track(new THREE.BoxGeometry(0.08, 0.07, 0.16)),
+      darkTitaniumMat
+    );
+    fhazCam.position.set(0.62, 0.42, 0);
+    this.roverGroup.add(fhazCam);
+    const fhazEye = new THREE.Mesh(
+      this.track(new THREE.CylinderGeometry(0.025, 0.025, 0.03, 8)),
+      fhazLensMat
+    );
+    fhazEye.rotation.z = Math.PI / 2;
+    fhazEye.position.set(0.665, 0.42, 0);
+    this.roverGroup.add(fhazEye);
+
+    this.roverGroup.add(this.roverMastGroup);
 
     // Rear angled MMRTG power fins
     const rtg = new THREE.Mesh(
       this.track(new THREE.CylinderGeometry(0.11, 0.14, 0.46, 8)),
       darkTitaniumMat
     );
-    rtg.position.set(-0.68, 0.52, 0);
+    rtg.position.set(-0.7, 0.54, 0);
     rtg.rotation.z = 0.95;
     rtg.castShadow = !this.isSoftwareGl;
-    roverGroup.add(rtg);
+    this.roverGroup.add(rtg);
 
-    this.scene.add(roverGroup);
+    this.scene.add(this.roverGroup);
+
+    // Red Laser Beam & Maintenance Spark Particle System
+    this.roverLaserGroup = new THREE.Group();
+    this.roverLaserGroup.visible = false;
+
+    const beamGeo = this.track(new THREE.CylinderGeometry(0.022, 0.022, 1, 8));
+    const coreBeamMat = this.track(
+      new THREE.MeshBasicMaterial({
+        color: '#FF3B3B',
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    this.roverLaserCore = new THREE.Mesh(beamGeo, coreBeamMat);
+    this.roverLaserGroup.add(this.roverLaserCore);
+
+    const glowBeamGeo = this.track(new THREE.CylinderGeometry(0.065, 0.065, 1, 8));
+    const glowBeamMat = this.track(
+      new THREE.MeshBasicMaterial({
+        color: '#FF6B6B',
+        transparent: true,
+        opacity: 0.34,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    this.roverLaserGlow = new THREE.Mesh(glowBeamGeo, glowBeamMat);
+    this.roverLaserGroup.add(this.roverLaserGlow);
+
+    const impactMat = this.track(
+      new THREE.MeshBasicMaterial({
+        color: '#FCA5A5',
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    this.roverImpactSpot = new THREE.Mesh(
+      this.track(new THREE.SphereGeometry(0.15, 10, 10)),
+      impactMat
+    );
+    this.roverLaserGroup.add(this.roverImpactSpot);
+
+    this.roverImpactLight = new THREE.PointLight('#FF2A2A', 2.4, 6.5, 1.5);
+    this.roverLaserGroup.add(this.roverImpactLight);
+
+    const sparkCount = 24;
+    this.roverSparkPositions = new Float32Array(sparkCount * 3);
+    this.roverSparkVelocities = [];
+    for (let i = 0; i < sparkCount; i++) {
+      const ang = (i / sparkCount) * Math.PI * 2;
+      this.roverSparkVelocities.push({
+        vx: Math.cos(ang) * (0.9 + (i % 3) * 0.45),
+        vy: 0.8 + (i % 4) * 0.55,
+        vz: Math.sin(ang) * (0.9 + (i % 3) * 0.45),
+        life: (i / sparkCount),
+      });
+    }
+    const sparkGeo = this.track(new THREE.BufferGeometry());
+    sparkGeo.setAttribute('position', new THREE.BufferAttribute(this.roverSparkPositions, 3));
+    const sparkMat = this.track(
+      new THREE.PointsMaterial({
+        color: '#FF6B4A',
+        size: 0.16,
+        transparent: true,
+        opacity: 0.9,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    this.roverSparksPoints = new THREE.Points(sparkGeo, sparkMat);
+    this.roverSparksPoints.frustumCulled = false;
+    this.roverLaserGroup.add(this.roverSparksPoints);
+
+    this.scene.add(this.roverLaserGroup);
   }
 
   private buildHazardsAndRings(): void {
@@ -2197,7 +2621,43 @@ float marsFbm(vec2 p) {
     dom.addEventListener('pointermove', this.handlePointerMove);
     dom.addEventListener('webglcontextlost', this.handleContextLost);
     window.addEventListener('resize', this.handleResize);
+    window.addEventListener('keydown', this.handleKeyDown);
+    window.addEventListener('keyup', this.handleKeyUp);
+    window.addEventListener('blur', this.handleWindowBlur);
   }
+
+  private handleWindowBlur = (): void => {
+    this.flushInteriorInputStep();
+    this.pressedKeys.clear();
+    this.isDraggingInteriorLook = false;
+  };
+
+  private handleKeyDown = (e: KeyboardEvent): void => {
+    if (this.viewMode !== 'interior') return;
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+    if (!this.pressedKeys.has(e.code)) {
+      this.flushInteriorInputStep();
+      this.pressedKeys.add(e.code);
+    }
+
+    if (e.code === 'KeyE' && !e.repeat && !this.interiorInputPaused) {
+      const nearest = this.computeNearestInteriorInteractable();
+      if (nearest) {
+        e.preventDefault();
+        this.interiorWorld?.triggerStationFeedback(nearest.interactable.id);
+        this.callbacks.onInteriorInteract?.(nearest.interactable.id);
+      }
+    }
+  };
+
+  private handleKeyUp = (e: KeyboardEvent): void => {
+    if (this.pressedKeys.has(e.code)) {
+      this.flushInteriorInputStep();
+      this.pressedKeys.delete(e.code);
+    }
+  };
 
   private handleContextLost = (e: Event): void => {
     e.preventDefault();
@@ -2210,6 +2670,11 @@ float marsFbm(vec2 p) {
     this.camera.fov = isPortrait ? 65 : 46;
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
+    if (this.interiorCamera) {
+      this.interiorCamera.fov = isPortrait ? 72 : 62;
+      this.interiorCamera.aspect = aspect;
+      this.interiorCamera.updateProjectionMatrix();
+    }
     if (resetPos) {
       if (isPortrait) {
         this.camera.position.set(0, 7.6, 30.5);
@@ -2228,9 +2693,50 @@ float marsFbm(vec2 p) {
     this.applyResponsiveCamera(width, height, true);
     this.controls.update();
     this.renderer.setSize(width, height);
-    this.renderer.render(this.scene, this.camera);
-    this.emitProjectedAnchors();
+    if (this.viewMode === 'interior') {
+      this.renderer.render(this.interiorWorld.scene, this.interiorCamera);
+    } else {
+      this.renderer.render(this.scene, this.camera);
+      this.emitProjectedAnchors();
+    }
   };
+
+  public deployRover(target: RoverMissionTarget): boolean {
+    if (this.roverPhase !== 'idle' || !this.roverGroup) return false;
+
+    const targetCenter =
+      target.kind === 'rock'
+        ? this.rockWorldCenters[target.rockId]
+        : this.moduleWorldCenters[target.moduleId];
+    if (!targetCenter) return false;
+
+    this.roverMissionTarget = target;
+    this.roverMissionNotified = false;
+    this.roverStartPos.copy(this.roverHomePos);
+
+    const standOff = target.kind === 'rock' ? 1.55 : target.kind === 'solar' ? 3.2 : 2.35;
+    const toTargetX = targetCenter.x - this.roverHomePos.x;
+    const toTargetZ = targetCenter.z - this.roverHomePos.z;
+    const dist = Math.max(0.01, Math.hypot(toTargetX, toTargetZ));
+    const stopDist = Math.max(0.4, dist - standOff);
+
+    const stopX = this.roverHomePos.x + (toTargetX / dist) * stopDist;
+    const stopZ = this.roverHomePos.z + (toTargetZ / dist) * stopDist;
+    this.roverStopPos.set(stopX, groundHeightAt(stopX, stopZ), stopZ);
+
+    const aimYOffset = target.kind === 'rock' ? 0.45 : target.kind === 'solar' ? 1.15 : 1.05;
+    this.roverAimPos.set(targetCenter.x, targetCenter.y + aimYOffset, targetCenter.z);
+
+    this.roverPhase = 'outbound';
+    this.roverPhaseElapsed = 0;
+    this.roverPhaseStartMs = performance.now();
+    this.callbacks.onRoverPhaseChange?.('outbound', target.label);
+    return true;
+  }
+
+  public getRoverPhase(): RoverPhase {
+    return this.roverPhase;
+  }
 
   private updatePointerNdc(e: PointerEvent): void {
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -2238,41 +2744,354 @@ float marsFbm(vec2 p) {
     this.pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   }
 
-  private pickModule(e: PointerEvent): ModuleId | null {
+  private pickTarget(e: PointerEvent): {
+    moduleId: ModuleId | null;
+    rockId: ScienceBoulderId | null;
+    rockLabel: string | null;
+  } {
     this.updatePointerNdc(e);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
     const hits = this.raycaster.intersectObjects(this.hitColliders, false);
-    if (hits.length === 0) return null;
-    return (hits[0].object.userData.moduleId as ModuleId) ?? null;
+    if (hits.length === 0) return { moduleId: null, rockId: null, rockLabel: null };
+    const ud = hits[0].object.userData;
+    return {
+      moduleId: (ud.moduleId as ModuleId) ?? null,
+      rockId: (ud.rockId as ScienceBoulderId) ?? null,
+      rockLabel: (ud.rockLabel as string) ?? null,
+    };
+  }
+
+  public setViewMode(mode: SceneViewMode): void {
+    if (this.viewMode === mode) return;
+    this.viewMode = mode;
+    this.pressedKeys.clear();
+    this.isDraggingInteriorLook = false;
+    this.hoverRing.visible = false;
+    this.hoveredModule = null;
+    this.hoveredRock = null;
+
+    if (mode === 'interior') {
+      this.controls.enabled = false;
+      this.interiorPlayer = {
+        x: INTERIOR_SPAWN.x,
+        z: INTERIOR_SPAWN.z,
+        yaw: INTERIOR_SPAWN.yaw,
+        pitch: 0,
+        walkDistance: 0,
+        bobOffset: 0,
+      };
+      this.interiorCamera.position.set(
+        this.interiorPlayer.x,
+        INTERIOR_EYE_HEIGHT,
+        this.interiorPlayer.z
+      );
+      this.interiorCamera.rotation.set(0, INTERIOR_SPAWN.yaw, 0, 'YXZ');
+      this.renderer.domElement.style.cursor = 'crosshair';
+      this.interiorWorld.update(0.016, {
+        resources: this.resources,
+        emergencyActive: this.emergencyMode !== 'none',
+        moxieCrisisActive:
+          this.emergencyMode !== 'none' ||
+          this.targetHazardType !== 'none' ||
+          this.resources.lifeSupportPct < 65 ||
+          this.donkiTelemetry.level !== 'quiet',
+        skyColor: this.skyColor,
+        zenithColor: this.zenithColor,
+        nightFactor: this.smoothedNightFactor,
+      });
+      this.emitInteriorState(true);
+    } else {
+      this.unlockInteriorPointer();
+      this.controls.enabled = true;
+      this.renderer.domElement.style.cursor = 'grab';
+      this.emitProjectedAnchors();
+    }
+
+    this.lastInteriorMoveTime = performance.now();
+    if (mode === 'interior') {
+      this.renderer.render(this.interiorWorld.scene, this.interiorCamera);
+    } else {
+      this.controls.update();
+      this.renderer.render(this.scene, this.camera);
+    }
+
+    this.callbacks.onViewModeChange?.(mode);
+  }
+
+  public getViewMode(): SceneViewMode {
+    return this.viewMode;
+  }
+
+  public setInteriorInputPaused(paused: boolean): void {
+    this.interiorInputPaused = paused;
+    if (paused) {
+      this.pressedKeys.clear();
+      this.isDraggingInteriorLook = false;
+      this.virtualInteriorInput = { forward: 0, right: 0, turn: 0 };
+      this.unlockInteriorPointer();
+    }
+    this.lastInteriorMoveTime = performance.now();
+  }
+
+  public unlockInteriorPointer(): void {
+    try {
+      if (this.pointerLockControls?.isLocked) {
+        this.pointerLockControls.unlock();
+      }
+    } catch {
+      // Ignore pointer lock API restrictions
+    }
+  }
+
+  public setVirtualInteriorInput(input: { forward: number; right: number; turn: number }): void {
+    this.flushInteriorInputStep();
+    this.virtualInteriorInput = input;
+  }
+
+  public triggerInteriorFeedback(id: InteriorInteractableId): void {
+    this.interiorWorld?.triggerStationFeedback(id);
+  }
+
+  private syncYawPitchFromCamera(): void {
+    if (!this.interiorCamera) return;
+    this.interiorPlayer.yaw = this.interiorCamera.rotation.y;
+    this.interiorPlayer.pitch = THREE.MathUtils.clamp(
+      this.interiorCamera.rotation.x,
+      -Math.PI * 0.42,
+      Math.PI * 0.42
+    );
+  }
+
+  private computeNearestInteriorInteractable(): {
+    interactable: InteriorInteractable;
+    distance: number;
+  } | null {
+    const yaw = this.pointerLockControls?.isLocked
+      ? this.interiorCamera.rotation.y
+      : this.interiorPlayer.yaw;
+    const lookX = -Math.sin(yaw);
+    const lookZ = -Math.cos(yaw);
+    return findNearestInteractable(
+      this.interiorPlayer.x,
+      this.interiorPlayer.z,
+      lookX,
+      lookZ
+    );
+  }
+
+  private emitInteriorState(force = false): void {
+    const zone = getInteriorZoneAt(this.interiorPlayer.x, this.interiorPlayer.z);
+    const nearest = this.computeNearestInteriorInteractable();
+    const nearestId = nearest?.interactable.id ?? null;
+    const locked = Boolean(this.pointerLockControls?.isLocked);
+
+    if (
+      force ||
+      zone.id !== this.lastInteriorZoneId ||
+      nearestId !== this.lastInteriorPromptId ||
+      locked !== this.lastInteriorLocked
+    ) {
+      this.lastInteriorZoneId = zone.id;
+      this.lastInteriorPromptId = nearestId;
+      this.lastInteriorLocked = locked;
+      this.interiorWorld?.setHighlightedInteractable(nearestId);
+      this.callbacks.onInteriorStateUpdate?.({
+        zone,
+        nearestInteractable: nearest?.interactable ?? null,
+        pointerLocked: locked,
+      });
+    }
+  }
+
+  private flushInteriorInputStep(now = performance.now()): void {
+    if (this.viewMode !== 'interior' || this.interiorInputPaused) {
+      this.lastInteriorMoveTime = now;
+      return;
+    }
+    const elapsedSec = Math.min(2.0, Math.max(0, (now - this.lastInteriorMoveTime) / 1000));
+    this.lastInteriorMoveTime = now;
+    if (elapsedSec > 0.0005) {
+      this.updateInteriorMovement(elapsedSec);
+    }
+  }
+
+  private updateInteriorMovement(totalDt: number): void {
+    if (this.viewMode !== 'interior' || this.interiorInputPaused) return;
+
+    const subSteps = Math.max(1, Math.ceil(totalDt / 0.05));
+    const stepDt = totalDt / subSteps;
+
+    const fwdKey =
+      (this.pressedKeys.has('KeyW') || this.pressedKeys.has('ArrowUp') ? 1 : 0) -
+      (this.pressedKeys.has('KeyS') || this.pressedKeys.has('ArrowDown') ? 1 : 0);
+    const strafeKey =
+      (this.pressedKeys.has('KeyD') || this.pressedKeys.has('ArrowRight') ? 1 : 0) -
+      (this.pressedKeys.has('KeyA') || this.pressedKeys.has('ArrowLeft') ? 1 : 0);
+
+    const moveForward = THREE.MathUtils.clamp(fwdKey + this.virtualInteriorInput.forward, -1, 1);
+    const moveRight = THREE.MathUtils.clamp(strafeKey + this.virtualInteriorInput.right, -1, 1);
+
+    for (let s = 0; s < subSteps; s++) {
+      if (this.pointerLockControls?.isLocked) {
+        this.syncYawPitchFromCamera();
+      } else if (this.virtualInteriorInput.turn !== 0) {
+        this.interiorPlayer.yaw -= this.virtualInteriorInput.turn * stepDt * 2.1;
+        this.interiorCamera.rotation.set(
+          this.interiorPlayer.pitch,
+          this.interiorPlayer.yaw,
+          0,
+          'YXZ'
+        );
+      }
+
+      if (Math.abs(moveForward) > 0.01 || Math.abs(moveRight) > 0.01) {
+        const len = Math.hypot(moveForward, moveRight);
+        const nf = len > 1 ? moveForward / len : moveForward;
+        const nr = len > 1 ? moveRight / len : moveRight;
+
+        const yaw = this.interiorPlayer.yaw;
+        const fwdX = -Math.sin(yaw);
+        const fwdZ = -Math.cos(yaw);
+        const rightX = Math.cos(yaw);
+        const rightZ = -Math.sin(yaw);
+
+        const speed = 4.8;
+        const dx = (fwdX * nf + rightX * nr) * speed * stepDt;
+        const dz = (fwdZ * nf + rightZ * nr) * speed * stepDt;
+
+        const prevX = this.interiorPlayer.x;
+        const prevZ = this.interiorPlayer.z;
+        const clamped = clampInteriorPlayerPosition(prevX, prevZ, prevX + dx, prevZ + dz);
+        this.interiorPlayer.x = clamped.x;
+        this.interiorPlayer.z = clamped.z;
+
+        const stepDist = Math.hypot(clamped.x - prevX, clamped.z - prevZ);
+        if (stepDist > 0.0005) {
+          this.interiorPlayer.walkDistance += stepDist;
+          this.interiorPlayer.bobOffset = Math.sin(this.interiorPlayer.walkDistance * 2.2) * 0.042;
+        } else {
+          this.interiorPlayer.bobOffset = THREE.MathUtils.lerp(
+            this.interiorPlayer.bobOffset,
+            0,
+            Math.min(1, stepDt * 10)
+          );
+        }
+      } else {
+        this.interiorPlayer.bobOffset = THREE.MathUtils.lerp(
+          this.interiorPlayer.bobOffset,
+          0,
+          Math.min(1, stepDt * 10)
+        );
+      }
+    }
+
+    this.interiorCamera.position.set(
+      this.interiorPlayer.x,
+      INTERIOR_EYE_HEIGHT + this.interiorPlayer.bobOffset,
+      this.interiorPlayer.z
+    );
+
+    this.emitInteriorState(false);
   }
 
   private handlePointerDown = (e: PointerEvent): void => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
+    if (this.viewMode === 'interior' && !this.interiorInputPaused && !this.pointerLockControls?.isLocked) {
+      this.isDraggingInteriorLook = true;
+      this.lastDragLookPos = { x: e.clientX, y: e.clientY };
+    }
   };
 
   private handlePointerMove = (e: PointerEvent): void => {
+    if (this.viewMode === 'interior') {
+      if (this.isDraggingInteriorLook && !this.pointerLockControls?.isLocked && !this.interiorInputPaused) {
+        const dx = e.clientX - this.lastDragLookPos.x;
+        const dy = e.clientY - this.lastDragLookPos.y;
+        this.lastDragLookPos = { x: e.clientX, y: e.clientY };
+        this.interiorPlayer.yaw -= dx * 0.0042;
+        this.interiorPlayer.pitch = THREE.MathUtils.clamp(
+          this.interiorPlayer.pitch - dy * 0.0036,
+          -Math.PI * 0.42,
+          Math.PI * 0.42
+        );
+        this.interiorCamera.rotation.set(
+          this.interiorPlayer.pitch,
+          this.interiorPlayer.yaw,
+          0,
+          'YXZ'
+        );
+        this.emitInteriorState(false);
+      }
+      return;
+    }
+
     if (this.nightAnim.active) return;
-    const hit = this.pickModule(e);
-    if (hit !== this.hoveredModule) {
-      this.hoveredModule = hit;
-      this.renderer.domElement.style.cursor = hit ? 'pointer' : 'grab';
-      if (hit) {
-        const center = this.moduleWorldCenters[hit];
+    const { moduleId, rockId } = this.pickTarget(e);
+    if (moduleId !== this.hoveredModule || rockId !== this.hoveredRock) {
+      this.hoveredModule = moduleId;
+      this.hoveredRock = rockId;
+      this.renderer.domElement.style.cursor = moduleId || rockId ? 'pointer' : 'grab';
+      if (moduleId) {
+        const center = this.moduleWorldCenters[moduleId];
+        this.hoverRing.position.set(center.x, center.y + 0.08, center.z);
+        this.hoverRing.visible = true;
+      } else if (rockId && this.rockWorldCenters[rockId]) {
+        const center = this.rockWorldCenters[rockId]!;
         this.hoverRing.position.set(center.x, center.y + 0.08, center.z);
         this.hoverRing.visible = true;
       } else {
         this.hoverRing.visible = false;
       }
-      this.callbacks.onHoverModule(hit);
+
+      (Object.keys(this.rockRings) as ScienceBoulderId[]).forEach((id) => {
+        const ring = this.rockRings[id];
+        if (ring) {
+          const mat = ring.material as THREE.MeshBasicMaterial;
+          mat.opacity = id === rockId ? 0.85 : 0.32;
+          mat.color.set(id === rockId ? '#FBBF24' : '#22D3EE');
+        }
+      });
+
+      this.callbacks.onHoverModule(moduleId);
+      this.callbacks.onHoverRock?.(rockId);
     }
   };
 
   private handlePointerUp = (e: PointerEvent): void => {
+    this.isDraggingInteriorLook = false;
     const travel = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
-    if (travel > 6 || this.nightAnim.active) return;
-    const hit = this.pickModule(e);
-    if (hit) {
-      this.callbacks.onModuleClick(hit);
+    if (travel > 6) return;
+
+    if (this.viewMode === 'interior') {
+      if (this.interiorInputPaused) return;
+      this.updatePointerNdc(e);
+      this.raycaster.setFromCamera(this.pointerNdc, this.interiorCamera);
+      const hits = this.raycaster.intersectObjects(this.interiorWorld.interactableColliders, false);
+      if (hits.length > 0 && hits[0].distance <= 4.5) {
+        const id = hits[0].object.userData.interactableId as InteriorInteractableId | undefined;
+        if (id) {
+          this.interiorWorld.triggerStationFeedback(id);
+          this.callbacks.onInteriorInteract?.(id);
+          return;
+        }
+      }
+
+      if (!this.pointerLockControls.isLocked) {
+        try {
+          this.pointerLockControls.lock();
+        } catch {
+          // Pointer lock optional; drag-look and virtual buttons remain active
+        }
+      }
+      return;
+    }
+
+    if (this.nightAnim.active) return;
+    const { moduleId, rockId, rockLabel } = this.pickTarget(e);
+    if (moduleId) {
+      this.callbacks.onModuleClick(moduleId);
+    } else if (rockId && rockLabel) {
+      this.callbacks.onRockClick?.(rockId, rockLabel);
     }
   };
 
@@ -2298,16 +3117,17 @@ float marsFbm(vec2 p) {
       const poll = () => {
         if (this.destroyed) return;
         const status = sync ? gl.clientWaitSync(sync, 0, 0) : gl.ALREADY_SIGNALED;
-        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+        if (status !== gl.TIMEOUT_EXPIRED) {
           if (sync) gl.deleteSync(sync);
-          this.swTimerId = window.setTimeout(cb, 80);
+          const delayMs = this.viewMode === 'interior' ? 24 : 80;
+          this.swTimerId = window.setTimeout(cb, delayMs);
         } else {
           this.swTimerId = window.setTimeout(poll, 16);
         }
       };
       this.swTimerId = window.setTimeout(poll, 16);
     } else {
-      this.swTimerId = window.setTimeout(cb, 90);
+      this.swTimerId = window.setTimeout(cb, this.viewMode === 'interior' ? 32 : 90);
     }
   }
 
@@ -2315,14 +3135,35 @@ float marsFbm(vec2 p) {
     if (this.destroyed || !this.renderer) return;
 
     const now = performance.now();
-    const dt = Math.min((now - this.lastFrameTime) / 1000, 0.1);
+    const rawDt = Math.max(0.001, (now - this.lastFrameTime) / 1000);
+    const dt = Math.min(rawDt, 0.1);
     this.lastFrameTime = now;
     this.totalTime += dt;
 
-    this.controls.update();
     this.updateAnimations(dt);
-    this.renderer.render(this.scene, this.camera);
-    this.emitProjectedAnchors();
+    this.updateRoverAnimation(Math.min(rawDt, 0.25), now);
+
+    if (this.viewMode === 'interior') {
+      this.flushInteriorInputStep(now);
+      const moxieCrisisActive =
+        this.emergencyMode !== 'none' ||
+        this.targetHazardType !== 'none' ||
+        this.resources.lifeSupportPct < 65 ||
+        this.donkiTelemetry.level !== 'quiet';
+      this.interiorWorld.update(dt, {
+        resources: this.resources,
+        emergencyActive: this.emergencyMode !== 'none',
+        moxieCrisisActive,
+        skyColor: this.skyColor,
+        zenithColor: this.zenithColor,
+        nightFactor: this.smoothedNightFactor,
+      });
+      this.renderer.render(this.interiorWorld.scene, this.interiorCamera);
+    } else {
+      this.controls.update();
+      this.renderer.render(this.scene, this.camera);
+      this.emitProjectedAnchors();
+    }
 
     if (this.isSoftwareGl) {
       this.afterDraw(() => {
@@ -3000,6 +3841,229 @@ float marsFbm(vec2 p) {
       this.lastAnchors = next;
       this.callbacks.onAnchorsUpdate(next);
     }
+
+    if (this.callbacks.onRockAnchorsUpdate) {
+      const rockIds: ScienceBoulderId[] = [
+        'rock-delta',
+        'rock-olivine',
+        'rock-carbonate',
+        'rock-sulfate',
+      ];
+      const nextRocks: ProjectedRockAnchor[] = rockIds
+        .map((id) => {
+          const wp = this.rockAnchorWorldMap[id];
+          if (!wp) return null;
+          this.projScratch.copy(wp).project(this.camera);
+          const visible =
+            this.projScratch.z >= -1 &&
+            this.projScratch.z <= 1 &&
+            this.projScratch.x >= -0.92 &&
+            this.projScratch.x <= 0.92 &&
+            this.projScratch.y >= -0.86 &&
+            this.projScratch.y <= 0.9;
+          const labelMap: Record<ScienceBoulderId, string> = {
+            'rock-delta': 'Delta Mudstone',
+            'rock-olivine': 'Olivine Basalt',
+            'rock-carbonate': 'Carbonate Outcrop',
+            'rock-sulfate': 'Sulfate Vein',
+          };
+          return {
+            id,
+            label: labelMap[id],
+            x: Math.round(((this.projScratch.x + 1) * 0.5) * width),
+            y: Math.round(((-this.projScratch.y + 1) * 0.5) * height),
+            visible,
+          };
+        })
+        .filter((x): x is ProjectedRockAnchor => x !== null);
+
+      const rocksChanged =
+        this.lastRockAnchors.length !== nextRocks.length ||
+        nextRocks.some((item, idx) => {
+          const prev = this.lastRockAnchors[idx];
+          return (
+            prev.visible !== item.visible ||
+            Math.abs(prev.x - item.x) >= 1.5 ||
+            Math.abs(prev.y - item.y) >= 1.5
+          );
+        });
+      if (rocksChanged) {
+        this.lastRockAnchors = nextRocks;
+        this.callbacks.onRockAnchorsUpdate(nextRocks);
+      }
+    }
+  }
+
+  private lerpYaw(current: number, target: number, alpha: number): number {
+    let diff = target - current;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return current + diff * alpha;
+  }
+
+  private updateRoverAnimation(dt: number, nowMs = performance.now()): void {
+    if (!this.roverGroup || this.roverPhase === 'idle') return;
+
+    this.roverPhaseElapsed = Math.max(0, (nowMs - this.roverPhaseStartMs) / 1000);
+    const outboundDuration = 2.0; // 2s out + 2s back = 4s total travel time
+    const workDuration = 3.0; // 3s pause with red laser & maintenance particles
+    const returnDuration = 2.0;
+
+    if (this.roverPhase === 'outbound') {
+      const t = Math.min(1, this.roverPhaseElapsed / outboundDuration);
+      const eased = t * t * (3 - 2 * t);
+      const prevX = this.roverGroup.position.x;
+      const prevZ = this.roverGroup.position.z;
+
+      this.roverGroup.position.lerpVectors(this.roverStartPos, this.roverStopPos, eased);
+      this.roverGroup.position.y = groundHeightAt(
+        this.roverGroup.position.x,
+        this.roverGroup.position.z
+      );
+
+      const dx = this.roverStopPos.x - this.roverStartPos.x;
+      const dz = this.roverStopPos.z - this.roverStartPos.z;
+      const travelYaw = Math.atan2(-dz, dx);
+      this.roverGroup.rotation.y = this.lerpYaw(
+        this.roverGroup.rotation.y,
+        travelYaw,
+        Math.min(1, dt * 8)
+      );
+
+      const stepDist = Math.hypot(
+        this.roverGroup.position.x - prevX,
+        this.roverGroup.position.z - prevZ
+      );
+      for (let i = 0; i < this.roverWheels.length; i++) {
+        this.roverWheels[i].rotation.z -= stepDist / 0.19;
+      }
+
+      if (t >= 1) {
+        this.roverPhase = 'working';
+        this.roverPhaseElapsed = 0;
+        this.roverPhaseStartMs = nowMs;
+        this.callbacks.onRoverPhaseChange?.('working', this.roverMissionTarget?.label ?? null);
+      }
+    } else if (this.roverPhase === 'working') {
+      const t = Math.min(1, this.roverPhaseElapsed / workDuration);
+
+      // Face target cleanly & pan articulated mast while firing red laser
+      const dx = this.roverAimPos.x - this.roverGroup.position.x;
+      const dz = this.roverAimPos.z - this.roverGroup.position.z;
+      const aimYaw = Math.atan2(-dz, dx);
+      this.roverGroup.rotation.y = this.lerpYaw(
+        this.roverGroup.rotation.y,
+        aimYaw,
+        Math.min(1, dt * 10)
+      );
+      this.roverMastGroup.rotation.y = Math.sin(this.roverPhaseElapsed * 3.8) * 0.18;
+      this.roverLaserEyeMat.emissiveIntensity = 3.2 + Math.sin(this.roverPhaseElapsed * 16) * 0.8;
+
+      this.roverGroup.updateMatrixWorld(true);
+      this.roverLaserEyeMesh.getWorldPosition(this.roverEyeWorldScratch);
+
+      // Sweep laser impact point slightly across the target surface
+      this.roverAimOscScratch.copy(this.roverAimPos);
+      this.roverAimOscScratch.x += Math.sin(this.roverPhaseElapsed * 4.5) * 0.22;
+      this.roverAimOscScratch.y += Math.cos(this.roverPhaseElapsed * 3.2) * 0.1;
+
+      this.roverBeamDirScratch.subVectors(this.roverAimOscScratch, this.roverEyeWorldScratch);
+      const beamLen = Math.max(0.1, this.roverBeamDirScratch.length());
+      this.roverBeamDirScratch.normalize();
+
+      this.roverMidScratch
+        .addVectors(this.roverEyeWorldScratch, this.roverAimOscScratch)
+        .multiplyScalar(0.5);
+
+      this.roverLaserGroup.visible = true;
+      this.roverLaserCore.position.copy(this.roverMidScratch);
+      this.roverLaserCore.scale.set(1, beamLen, 1);
+      this.roverLaserCore.quaternion.setFromUnitVectors(
+        this.roverUpScratch,
+        this.roverBeamDirScratch
+      );
+
+      this.roverLaserGlow.position.copy(this.roverMidScratch);
+      this.roverLaserGlow.scale.set(1, beamLen, 1);
+      this.roverLaserGlow.quaternion.copy(this.roverLaserCore.quaternion);
+
+      const pulse = 0.85 + 0.35 * Math.sin(this.roverPhaseElapsed * 22);
+      this.roverImpactSpot.position.copy(this.roverAimOscScratch);
+      this.roverImpactSpot.scale.set(pulse, pulse, pulse);
+      this.roverImpactLight.position.copy(this.roverAimOscScratch);
+
+      // Update pooled spark particles radiating from laser impact point
+      for (let i = 0; i < this.roverSparkVelocities.length; i++) {
+        const sp = this.roverSparkVelocities[i];
+        sp.life += dt * 2.1;
+        if (sp.life >= 1) sp.life -= 1;
+        const l = sp.life;
+        this.roverSparkPositions[i * 3] = this.roverAimOscScratch.x + sp.vx * l * 0.65;
+        this.roverSparkPositions[i * 3 + 1] =
+          this.roverAimOscScratch.y + (sp.vy * l - 1.4 * l * l) * 0.55;
+        this.roverSparkPositions[i * 3 + 2] = this.roverAimOscScratch.z + sp.vz * l * 0.65;
+      }
+      this.roverSparksPoints.geometry.attributes.position.needsUpdate = true;
+
+      if (t >= 1) {
+        this.roverLaserGroup.visible = false;
+        this.roverMastGroup.rotation.y = 0;
+        this.roverLaserEyeMat.emissiveIntensity = 1.8;
+        if (!this.roverMissionNotified && this.roverMissionTarget) {
+          this.roverMissionNotified = true;
+          this.callbacks.onRoverTaskComplete?.(this.roverMissionTarget);
+        }
+        this.roverPhase = 'returning';
+        this.roverPhaseElapsed = 0;
+        this.roverPhaseStartMs = nowMs;
+        this.callbacks.onRoverPhaseChange?.('returning', this.roverMissionTarget?.label ?? null);
+      }
+    } else if (this.roverPhase === 'returning') {
+      const t = Math.min(1, this.roverPhaseElapsed / returnDuration);
+      const eased = t * t * (3 - 2 * t);
+      const prevX = this.roverGroup.position.x;
+      const prevZ = this.roverGroup.position.z;
+
+      this.roverGroup.position.lerpVectors(this.roverStopPos, this.roverHomePos, eased);
+      this.roverGroup.position.y = groundHeightAt(
+        this.roverGroup.position.x,
+        this.roverGroup.position.z
+      );
+
+      if (t < 0.82) {
+        const dx = this.roverHomePos.x - this.roverStopPos.x;
+        const dz = this.roverHomePos.z - this.roverStopPos.z;
+        const returnYaw = Math.atan2(-dz, dx);
+        this.roverGroup.rotation.y = this.lerpYaw(
+          this.roverGroup.rotation.y,
+          returnYaw,
+          Math.min(1, dt * 8)
+        );
+      } else {
+        this.roverGroup.rotation.y = this.lerpYaw(
+          this.roverGroup.rotation.y,
+          this.roverHomeYaw,
+          Math.min(1, dt * 8)
+        );
+      }
+
+      const stepDist = Math.hypot(
+        this.roverGroup.position.x - prevX,
+        this.roverGroup.position.z - prevZ
+      );
+      for (let i = 0; i < this.roverWheels.length; i++) {
+        this.roverWheels[i].rotation.z -= stepDist / 0.19;
+      }
+
+      if (t >= 1) {
+        this.roverGroup.position.copy(this.roverHomePos);
+        this.roverGroup.rotation.y = this.roverHomeYaw;
+        this.roverPhase = 'idle';
+        this.roverPhaseElapsed = 0;
+        this.roverMissionTarget = null;
+        this.callbacks.onRoverPhaseChange?.('idle', null);
+      }
+    }
   }
 
   public dispose(): void {
@@ -3016,7 +4080,12 @@ float marsFbm(vec2 p) {
       dom.remove();
     }
     window.removeEventListener('resize', this.handleResize);
+    window.removeEventListener('keydown', this.handleKeyDown);
+    window.removeEventListener('keyup', this.handleKeyUp);
+    window.removeEventListener('blur', this.handleWindowBlur);
 
+    this.pointerLockControls?.dispose();
+    this.interiorWorld?.dispose();
     this.controls?.dispose();
     this.envRenderTarget?.dispose();
     this.pmremGenerator?.dispose();
